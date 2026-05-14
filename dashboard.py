@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import io
-from datetime import datetime
+import csv
 
 # ─────────────────────────────────────────
 # CONFIGURAÇÕES GERAIS
@@ -49,9 +49,12 @@ def formatar_tempo(segundos):
 
 
 def duracao_para_segundos(valor):
+    """Converte HH:MM:SS, HH:MM:SS.mmm ou MM:SS em segundos inteiros."""
     if pd.isna(valor) or str(valor).strip() in ("", "-", "nan"):
         return np.nan
     valor = str(valor).strip()
+    # Remove milissegundos se existir (ex: 00:14:03.923)
+    valor = valor.split(".")[0]
     partes = valor.split(":")
     try:
         if len(partes) == 3:
@@ -73,6 +76,16 @@ def card_metrica(titulo, valor):
     """, unsafe_allow_html=True)
 
 
+def normalizar_id(valor):
+    """Normaliza IDs para comparação: strip, lowercase, remove hífens extras."""
+    if pd.isna(valor):
+        return np.nan
+    s = str(valor).strip().lower()
+    if s in ("nan", "", "none"):
+        return np.nan
+    return s
+
+
 # ─────────────────────────────────────────
 # CARREGAMENTO DO ZENDESK
 # ─────────────────────────────────────────
@@ -80,49 +93,42 @@ def card_metrica(titulo, valor):
 def carregar_zendesk(arquivo):
     """
     Carrega o XLSX do Zendesk.
-    Colunas relevantes:
-      - 'ID do ticket'
-      - 'Assuntos do Ticket'
-      - 'Criação do ticket - Carimbo de data/hora'
-      - 'ID Genesys'   ← chave de cruzamento
-      - 'Matricula'
-      - 'Tickets'
+    Estrutura real confirmada:
+      ID do ticket | Assuntos do Ticket | Criação do ticket - Carimbo de data/hora
+      | ID Genesys | Matricula | Tickets | Arquivo_Origem
     """
     try:
-        df = pd.read_excel(arquivo, engine="openpyxl")
+        df = pd.read_excel(arquivo, engine="openpyxl", dtype=str)
         df.columns = df.columns.str.strip()
 
-        # Garante que as colunas essenciais existem
-        colunas_esperadas = {
-            "ID do ticket":                              "ticket_id",
-            "Assuntos do Ticket":                        "assunto",
-            "Criação do ticket - Carimbo de data/hora":  "data_criacao_zen",
-            "ID Genesys":                                "id_genesys",       # ← chave
-            "Matricula":                                 "matricula",
-            "Tickets":                                   "tickets_zen",
+        renomear = {
+            "ID do ticket":                             "ticket_id",
+            "Assuntos do Ticket":                       "assunto",
+            "Criação do ticket - Carimbo de data/hora": "data_criacao_zen",
+            "ID Genesys":                               "id_genesys",
+            "Matricula":                                "matricula",
+            "Tickets":                                  "tickets_zen",
+            "Arquivo_Origem":                           "arquivo_origem_zen",
         }
-
-        renomear = {k: v for k, v in colunas_esperadas.items() if k in df.columns}
-        df = df.rename(columns=renomear)
+        df = df.rename(columns={k: v for k, v in renomear.items() if k in df.columns})
 
         if "data_criacao_zen" in df.columns:
             df["data_criacao_zen"] = pd.to_datetime(
                 df["data_criacao_zen"], errors="coerce", dayfirst=False
             )
 
-        if "ticket_id" in df.columns:
-            df["ticket_id"] = df["ticket_id"].astype(str).str.strip()
-
-        # Normaliza a chave: string, strip, lowercase para facilitar o match
+        # Normaliza chave
         if "id_genesys" in df.columns:
-            df["id_genesys"] = (
-                df["id_genesys"]
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .replace("nan", np.nan)
-            )
+            df["id_genesys_norm"] = df["id_genesys"].apply(normalizar_id)
 
+        # Remove linhas sem ID Genesys (não vão cruzar de qualquer forma)
+        total_antes = len(df)
+        df_com_id = df[df.get("id_genesys_norm", pd.Series(dtype=str)).notna()]
+
+        st.info(
+            f"📋 Zendesk: {total_antes} tickets carregados, "
+            f"{len(df_com_id)} com ID Genesys preenchido."
+        )
         return df
 
     except Exception as e:
@@ -131,196 +137,281 @@ def carregar_zendesk(arquivo):
 
 
 # ─────────────────────────────────────────
-# CARREGAMENTO DO GENESYS
+# CARREGAMENTO DO GENESYS (PARSER ROBUSTO)
 # ─────────────────────────────────────────
 
 def carregar_genesys(arquivo):
     """
-    Carrega o CSV do Genesys (separador pipe |, metadados no topo).
-    Colunas relevantes:
-      - 'ID de conversa'            ← chave de cruzamento
-      - 'Usuários – Interagiram'    → nome_agente
-      - 'Data'                      → data_atendimento
-      - 'Duração'                   → duracao_str / duracao_segundos
-      - 'ANI'                       → número do chamador
-      - 'Tipo de desconexão'
-      - 'Filtros'                   → fila
+    Parser robusto para o CSV do Genesys.
+
+    Características conhecidas do arquivo:
+    - Separador: pipe |
+    - Metadados nas primeiras linhas (ex: "Exportação total concluída")
+    - Aspas dentro dos dados causam erro com parser padrão
+    - Colunas esperadas (ordem pode variar):
+        Exportação total concluída | Carimbo de data/hora do resultado parcial
+        | Filtros | Usuários – Interagiram | Data | Duração | ANI
+        | Tipo de desconexão | (possivelmente) ID de conversa
+
+    Solução: lê linha a linha, ignora quoting, split manual por pipe.
     """
     try:
         conteudo_bytes = arquivo.read()
 
-        # Tenta UTF-8, depois latin-1
-        for enc in ("utf-8", "latin-1", "utf-8-sig"):
+        # Detecta encoding
+        conteudo = None
+        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
             try:
                 conteudo = conteudo_bytes.decode(enc)
                 break
             except Exception:
                 continue
 
+        if conteudo is None:
+            st.error("Não foi possível decodificar o arquivo Genesys.")
+            return pd.DataFrame()
+
         linhas = conteudo.splitlines()
 
-        # Localiza a linha de cabeçalho real (contém "Usuários" ou "ID de conversa")
+        # ── Localiza a linha de cabeçalho ─────────────────────────────────
+        # Estratégia: primeira linha com pelo menos 3 pipes
         idx_header = None
         for i, linha in enumerate(linhas):
-            linha_lower = linha.lower()
-            if "id de conversa" in linha_lower or "usuários" in linha_lower or "usuari" in linha_lower:
+            if linha.count("|") >= 3:
                 idx_header = i
                 break
-
-        # Fallback: procura qualquer linha com pelo menos 4 pipes
-        if idx_header is None:
-            for i, linha in enumerate(linhas):
-                if linha.count("|") >= 4:
-                    idx_header = i
-                    break
 
         if idx_header is None:
             st.error("Não foi possível identificar o cabeçalho no arquivo Genesys.")
             return pd.DataFrame()
 
-        csv_limpo = "\n".join(linhas[idx_header:])
-        df = pd.read_csv(
-            io.StringIO(csv_limpo),
-            sep="|",
-            engine="python",
-            skipinitialspace=True,
-            dtype=str
-        )
+        # ── Parse manual linha a linha (evita problemas com quoting) ──────
+        # Divide cada linha pelo pipe e ignora completamente as aspas como delimitadores
+        cabecalho_raw = linhas[idx_header].split("|")
+        colunas = [c.strip() for c in cabecalho_raw]
+        # Remove colunas vazias das extremidades (artefato do pipe no início/fim da linha)
+        while colunas and colunas[0] == "":
+            colunas.pop(0)
+        while colunas and colunas[-1] == "":
+            colunas.pop()
 
-        # Remove colunas e linhas completamente vazias
-        df = df.dropna(axis=1, how="all")
-        df = df.dropna(axis=0, how="all")
-        df.columns = [str(c).strip() for c in df.columns]
+        n_colunas = len(colunas)
 
-        # ── Mapeamento dinâmico de colunas ──────────────────────────────────
+        registros = []
+        for linha in linhas[idx_header + 1:]:
+            if not linha.strip() or linha.strip() == "|":
+                continue
+            partes = linha.split("|")
+            partes = [p.strip() for p in partes]
+            # Remove extremidades vazias (pipe inicial/final)
+            while partes and partes[0] == "":
+                partes.pop(0)
+            while partes and partes[-1] == "":
+                partes.pop()
+
+            # Pula linhas claramente de metadados/rodapé
+            if len(partes) < 2:
+                continue
+
+            # Ajusta tamanho para bater com o cabeçalho
+            if len(partes) < n_colunas:
+                partes += [""] * (n_colunas - len(partes))
+            elif len(partes) > n_colunas:
+                partes = partes[:n_colunas]
+
+            registros.append(partes)
+
+        if not registros:
+            st.error("Nenhum registro encontrado no arquivo Genesys após o cabeçalho.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(registros, columns=colunas)
+
+        # ── Diagnóstico: mostra colunas encontradas ────────────────────────
+        with st.expander("🔍 Diagnóstico: colunas encontradas no arquivo Genesys"):
+            st.write(list(df.columns))
+            st.dataframe(df.head(3))
+
+        # ── Mapeamento dinâmico de colunas ────────────────────────────────
         renomear = {}
         for col in df.columns:
-            col_lower = col.lower().strip()
-            if "id de conversa" in col_lower or "conversation" in col_lower:
-                renomear[col] = "id_genesys"          # ← chave
-            elif "usuário" in col_lower or "usuario" in col_lower or "interagi" in col_lower:
+            col_norm = col.lower().strip()
+            # Chave de cruzamento — tenta variações do nome
+            if any(x in col_norm for x in ["id de conversa", "conversation id", "id conversa", "conversationid"]):
+                renomear[col] = "id_genesys"
+            elif any(x in col_norm for x in ["usuário", "usuario", "interagi", "agente"]):
                 renomear[col] = "nome_agente"
-            elif col_lower == "data" or "data/hora" in col_lower:
+            elif col_norm == "data" or "data/hora" in col_norm:
                 renomear[col] = "data_atendimento"
-            elif "duração" in col_lower or "duracao" in col_lower:
+            elif "carimbo" in col_norm:
+                renomear[col] = "carimbo_parcial"
+            elif "duração" in col_norm or "duracao" in col_norm:
                 renomear[col] = "duracao_str"
-            elif "filtro" in col_lower:
+            elif "filtro" in col_norm:
                 renomear[col] = "filtros"
-            elif "ani" in col_lower:
+            elif col_norm == "ani":
                 renomear[col] = "ani"
-            elif "desconexão" in col_lower or "desconexao" in col_lower:
+            elif "desconex" in col_norm:
                 renomear[col] = "tipo_desconexao"
-            elif "exportação" in col_lower or "exportacao" in col_lower:
+            elif "exporta" in col_norm:
                 renomear[col] = "exportacao"
 
         df = df.rename(columns=renomear)
 
-        # Se não encontrou coluna de duração pelo nome, tenta pelo padrão HH:MM:SS
-        if "duracao_str" not in df.columns:
+        # ── Se não encontrou id_genesys, tenta coluna por posição ─────────
+        # (o ID de conversa costuma ser uma das primeiras colunas numéricas/GUID)
+        if "id_genesys" not in df.columns:
+            st.warning(
+                "⚠️ Coluna 'ID de conversa' não identificada pelo nome. "
+                "Tentando identificar pelo conteúdo (padrão GUID)..."
+            )
             for col in df.columns:
                 amostra = df[col].dropna().astype(str).head(20)
-                if amostra.str.match(r"^\s*\d{1,2}:\d{2}:\d{2}\s*$").sum() >= 3:
-                    df = df.rename(columns={col: "duracao_str"})
+                # GUID pattern: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+                guid_matches = amostra.str.match(
+                    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    case=False
+                ).sum()
+                if guid_matches >= 3:
+                    st.info(f"✅ Coluna '{col}' identificada como ID de conversa pelo padrão GUID.")
+                    df = df.rename(columns={col: "id_genesys"})
                     break
 
-        # Normaliza chave: string, strip, lowercase
-        if "id_genesys" in df.columns:
-            df["id_genesys"] = (
-                df["id_genesys"]
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .replace("nan", np.nan)
-            )
-        else:
-            # Se a coluna de ID ainda não foi encontrada, exibe aviso e lista colunas disponíveis
-            st.warning(
-                f"⚠️ Coluna 'ID de conversa' não encontrada no Genesys. "
-                f"Colunas disponíveis: {list(df.columns)}"
-            )
-
-        # Extrai fila da coluna filtros
+        # ── Extrai fila ───────────────────────────────────────────────────
         if "filtros" in df.columns:
             df["fila"] = df["filtros"].str.extract(r"Fila:\s*(.+)", expand=False).str.strip()
         else:
             df["fila"] = "URA_CORSAN"
 
-        # Converte duração
+        # ── Converte duração ──────────────────────────────────────────────
+        # Tenta coluna mapeada; se não, busca pelo padrão HH:MM:SS
+        if "duracao_str" not in df.columns:
+            for col in df.columns:
+                if col in ("id_genesys", "nome_agente", "data_atendimento", "filtros", "fila", "ani", "tipo_desconexao"):
+                    continue
+                amostra = df[col].dropna().astype(str).head(30)
+                matches = amostra.str.match(r"^\d{1,2}:\d{2}:\d{2}").sum()
+                if matches >= 3:
+                    df = df.rename(columns={col: "duracao_str"})
+                    break
+
         if "duracao_str" in df.columns:
             df["duracao_str"] = df["duracao_str"].astype(str).str.strip()
             df["duracao_segundos"] = df["duracao_str"].apply(duracao_para_segundos)
         else:
             df["duracao_segundos"] = np.nan
+            st.warning("⚠️ Coluna de duração não encontrada. TMA não será calculado.")
 
-        # Converte data
-        if "data_atendimento" in df.columns:
+        # ── Converte data ─────────────────────────────────────────────────
+        col_data = "data_atendimento" if "data_atendimento" in df.columns else \
+                   "carimbo_parcial" if "carimbo_parcial" in df.columns else None
+
+        if col_data:
+            if col_data == "carimbo_parcial":
+                df = df.rename(columns={"carimbo_parcial": "data_atendimento"})
+                col_data = "data_atendimento"
             df["data_atendimento"] = pd.to_datetime(
                 df["data_atendimento"].astype(str).str.strip(),
                 errors="coerce",
                 dayfirst=True
             )
+        else:
+            df["data_atendimento"] = pd.NaT
+            st.warning("⚠️ Coluna de data não encontrada.")
 
-        # Limpa nome do agente
+        # ── Limpa nome do agente ──────────────────────────────────────────
         if "nome_agente" in df.columns:
             df["nome_agente"] = df["nome_agente"].astype(str).str.strip()
-            # Remove linhas de metadados (nome muito curto ou vazio)
             df = df[df["nome_agente"].str.len() > 2]
+            df = df[~df["nome_agente"].isin(["nan", "None", ""])]
 
+        # ── Normaliza chave ───────────────────────────────────────────────
+        if "id_genesys" in df.columns:
+            df["id_genesys_norm"] = df["id_genesys"].apply(normalizar_id)
+        else:
+            df["id_genesys_norm"] = np.nan
+            st.warning(
+                "⚠️ ID de conversa não encontrado no Genesys. "
+                "O cruzamento com o Zendesk não será possível. "
+                "Os dados do Genesys serão carregados sem o assunto do ticket."
+            )
+
+        df = df.reset_index(drop=True)
+        st.success(f"✅ Genesys: {len(df)} registros carregados.")
         return df
 
     except Exception as e:
         st.error(f"Erro ao carregar Genesys: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return pd.DataFrame()
 
 
 # ─────────────────────────────────────────
-# INTEGRAÇÃO (MERGE) DOS DOIS ARQUIVOS
+# INTEGRAÇÃO (MERGE)
 # ─────────────────────────────────────────
 
 def integrar_dados(df_zen, df_gen):
     """
-    Faz o cruzamento pelo ID de conversa do Genesys.
-    Base: Genesys (tem a duração e dados de agente).
+    Cruzamento principal:
+      Zendesk.id_genesys_norm  ←→  Genesys.id_genesys_norm
+
+    Base: Genesys (sempre tem dados de duração e agente).
     Enriquece com: assunto, ticket_id, matricula do Zendesk.
     """
     if df_gen.empty:
         st.error("Arquivo Genesys vazio após processamento.")
         return pd.DataFrame()
 
-    if df_zen.empty or "id_genesys" not in df_zen.columns:
-        st.warning("Zendesk sem dados ou sem coluna 'ID Genesys'. Continuando só com Genesys.")
-        return df_gen.copy()
+    df = df_gen.copy()
 
-    if "id_genesys" not in df_gen.columns:
-        st.error("Coluna 'ID de conversa' não encontrada no Genesys após processamento.")
-        return df_gen.copy()
+    if df_zen.empty or "id_genesys_norm" not in df_zen.columns:
+        st.warning("Zendesk não disponível. Continuando apenas com dados do Genesys.")
+        df["assunto"]    = np.nan
+        df["ticket_id"]  = np.nan
+        df["matricula"]  = np.nan
+        return df
 
-    # Colunas do Zendesk para trazer no merge
-    colunas_zen = ["id_genesys"]
+    if "id_genesys_norm" not in df.columns:
+        st.warning("ID de conversa ausente no Genesys. Sem cruzamento possível.")
+        df["assunto"]    = np.nan
+        df["ticket_id"]  = np.nan
+        df["matricula"]  = np.nan
+        return df
+
+    # Colunas do Zendesk para trazer
+    colunas_zen = ["id_genesys_norm"]
     for col in ["ticket_id", "assunto", "matricula", "data_criacao_zen", "tickets_zen"]:
         if col in df_zen.columns:
             colunas_zen.append(col)
 
-    df_zen_slim = df_zen[colunas_zen].copy()
+    df_zen_slim = df_zen[colunas_zen].drop_duplicates(subset=["id_genesys_norm"])
 
-    # Merge: base Genesys + enriquecimento Zendesk (left join)
-    df = pd.merge(
-        df_gen,
+    # Left join: todos os registros do Genesys + dados do Zendesk quando existir
+    df_merged = pd.merge(
+        df,
         df_zen_slim,
-        on="id_genesys",
+        on="id_genesys_norm",
         how="left",
-        suffixes=("_gen", "_zen")
+        suffixes=("", "_zen")
     )
 
-    # Log de aproveitamento do merge
-    total = len(df)
-    com_assunto = df["assunto"].notna().sum() if "assunto" in df.columns else 0
-    st.info(
-        f"✅ Merge concluído: {total:,} registros Genesys | "
-        f"{com_assunto:,} cruzados com Zendesk ({com_assunto/total*100:.1f}%)"
+    total = len(df_merged)
+    com_assunto = df_merged["assunto"].notna().sum() if "assunto" in df_merged.columns else 0
+
+    st.success(
+        f"✅ Merge concluído: {total:,} registros do Genesys | "
+        f"{com_assunto:,} cruzados com Zendesk ({com_assunto/total*100:.1f}% de aproveitamento)"
     )
 
-    return df
+    if com_assunto == 0:
+        st.warning(
+            "⚠️ Nenhum registro cruzou com o Zendesk. "
+            "Verifique se a coluna 'ID de conversa' do Genesys contém os mesmos valores "
+            "que a coluna 'ID Genesys' do Zendesk."
+        )
+
+    return df_merged
 
 
 # ─────────────────────────────────────────
@@ -342,7 +433,12 @@ def carregar_historico():
 
 def salvar_historico(df):
     try:
-        df.to_parquet(HISTORICO_PATH, index=False)
+        # Garante que colunas com tipos mistos sejam convertidas para string antes de salvar
+        df_salvar = df.copy()
+        for col in df_salvar.columns:
+            if df_salvar[col].dtype == object:
+                df_salvar[col] = df_salvar[col].astype(str).replace("nan", np.nan)
+        df_salvar.to_parquet(HISTORICO_PATH, index=False)
         return True
     except Exception as e:
         st.error(f"Erro ao salvar histórico: {e}")
@@ -355,12 +451,11 @@ def adicionar_ao_historico(df_novo, df_hist):
 
     df_combinado = pd.concat([df_hist, df_novo], ignore_index=True)
 
-    # Deduplicação: por id_genesys (se existir) ou por agente + data + duração
-    if "id_genesys" in df_combinado.columns:
-        # Mantém linhas sem id_genesys (podem ser legítimas)
-        com_id = df_combinado[df_combinado["id_genesys"].notna()]
-        sem_id = df_combinado[df_combinado["id_genesys"].isna()]
-        com_id = com_id.drop_duplicates(subset=["id_genesys"], keep="last")
+    # Deduplicação por id_genesys_norm (mais confiável)
+    if "id_genesys_norm" in df_combinado.columns:
+        com_id = df_combinado[df_combinado["id_genesys_norm"].notna() & (df_combinado["id_genesys_norm"] != "nan")]
+        sem_id = df_combinado[df_combinado["id_genesys_norm"].isna() | (df_combinado["id_genesys_norm"] == "nan")]
+        com_id = com_id.drop_duplicates(subset=["id_genesys_norm"], keep="last")
         df_combinado = pd.concat([com_id, sem_id], ignore_index=True)
     else:
         chaves = [c for c in ["nome_agente", "data_atendimento", "duracao_segundos"] if c in df_combinado.columns]
@@ -397,8 +492,8 @@ def aplicar_filtros(df):
                 (df_f["data_atendimento"].dt.date <= fim)
             ]
 
-    # Hora do dia
-    hora_range = st.sidebar.slider("Horário do atendimento (hora)", 0, 23, (0, 23))
+    # Horário
+    hora_range = st.sidebar.slider("Horário (hora do dia)", 0, 23, (0, 23))
     if "data_atendimento" in df_f.columns:
         df_f = df_f[
             (df_f["data_atendimento"].dt.hour >= hora_range[0]) &
@@ -408,6 +503,7 @@ def aplicar_filtros(df):
     # Agente
     if "nome_agente" in df_f.columns:
         agentes = sorted(df_f["nome_agente"].dropna().unique())
+        agentes = [a for a in agentes if a not in ("nan", "", "None")]
         sel = st.sidebar.multiselect("Agente", options=agentes, default=agentes)
         if sel:
             df_f = df_f[df_f["nome_agente"].isin(sel)]
@@ -415,16 +511,20 @@ def aplicar_filtros(df):
     # Assunto
     if "assunto" in df_f.columns and df_f["assunto"].notna().any():
         assuntos = sorted(df_f["assunto"].dropna().unique())
-        sel_ass = st.sidebar.multiselect("Assunto", options=assuntos, default=assuntos)
-        if sel_ass:
-            df_f = df_f[df_f["assunto"].isin(sel_ass)]
+        assuntos = [a for a in assuntos if a not in ("nan", "", "None")]
+        if assuntos:
+            sel_ass = st.sidebar.multiselect("Assunto", options=assuntos, default=assuntos)
+            if sel_ass:
+                df_f = df_f[df_f["assunto"].isin(sel_ass)]
 
     # Fila
     if "fila" in df_f.columns and df_f["fila"].notna().any():
         filas = sorted(df_f["fila"].dropna().unique())
-        sel_fila = st.sidebar.multiselect("Fila", options=filas, default=filas)
-        if sel_fila:
-            df_f = df_f[df_f["fila"].isin(sel_fila)]
+        filas = [f for f in filas if f not in ("nan", "", "None")]
+        if filas:
+            sel_fila = st.sidebar.multiselect("Fila", options=filas, default=filas)
+            if sel_fila:
+                df_f = df_f[df_f["fila"].isin(sel_fila)]
 
     st.sidebar.markdown(f"**📌 Registros filtrados:** `{len(df_f):,}`")
     return df_f
@@ -437,25 +537,25 @@ def aplicar_filtros(df):
 def secao_visao_geral(df):
     st.markdown('<h3 class="section-title">📊 Visão Geral</h3>', unsafe_allow_html=True)
 
-    total         = len(df)
-    tma           = df["duracao_segundos"].mean() if "duracao_segundos" in df.columns else None
-    total_horas   = (df["duracao_segundos"].sum() / 3600) if "duracao_segundos" in df.columns else 0
-    n_agentes     = df["nome_agente"].nunique() if "nome_agente" in df.columns else 0
-    taxa_cruzamento = (
+    total       = len(df)
+    tma         = df["duracao_segundos"].mean() if "duracao_segundos" in df.columns else None
+    total_horas = df["duracao_segundos"].sum() / 3600 if "duracao_segundos" in df.columns else 0
+    n_agentes   = df["nome_agente"].nunique() if "nome_agente" in df.columns else 0
+    taxa_cruz   = (
         df["assunto"].notna().sum() / total * 100
         if "assunto" in df.columns and total > 0 else 0
     )
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    with col1: card_metrica("Total de Atendimentos", f"{total:,}")
+    with col1: card_metrica("Total Atendimentos", f"{total:,}")
     with col2: card_metrica("TMA Geral", formatar_tempo(tma))
     with col3: card_metrica("Horas em Atendimento", f"{total_horas:.1f}h")
     with col4: card_metrica("Agentes Ativos", str(n_agentes))
-    with col5: card_metrica("Cruzados c/ Zendesk", f"{taxa_cruzamento:.0f}%")
+    with col5: card_metrica("Cruzados c/ Zendesk", f"{taxa_cruz:.0f}%")
 
     st.markdown("---")
 
-    if "data_atendimento" in df.columns:
+    if "data_atendimento" in df.columns and df["data_atendimento"].notna().any():
         col_a, col_b = st.columns(2)
 
         with col_a:
@@ -480,7 +580,7 @@ def secao_visao_geral(df):
             )
             st.line_chart(df_tma_dia.set_index("Data"))
 
-        # Mapa de calor: hora × dia da semana
+        # Mapa de calor hora × dia da semana
         st.markdown("**🔥 Mapa de Calor: Volume por Hora × Dia da Semana**")
         traduzir = {
             "Monday": "Seg", "Tuesday": "Ter", "Wednesday": "Qua",
@@ -505,11 +605,13 @@ def secao_por_assunto(df):
     st.markdown('<h3 class="section-title">🗂️ Análise por Assunto</h3>', unsafe_allow_html=True)
 
     if "assunto" not in df.columns or df["assunto"].isna().all():
-        st.info("Dados de assunto não disponíveis — verifique se o cruzamento com o Zendesk funcionou.")
+        st.info("Dados de assunto indisponíveis — o cruzamento com o Zendesk pode não ter funcionado.")
         return
 
+    df_valido = df[df["assunto"].notna() & (df["assunto"].astype(str) != "nan")]
+
     df_ass = (
-        df.groupby("assunto", dropna=True)
+        df_valido.groupby("assunto", dropna=True)
         .agg(
             Atendimentos=("nome_agente", "count"),
             TMA_s=("duracao_segundos", "mean"),
@@ -518,8 +620,8 @@ def secao_por_assunto(df):
         .reset_index()
         .sort_values("Atendimentos", ascending=False)
     )
-    df_ass["TMA"]          = df_ass["TMA_s"].apply(formatar_tempo)
-    df_ass["Tempo Total"]  = df_ass["Tempo_Total_s"].apply(formatar_tempo)
+    df_ass["TMA"]         = df_ass["TMA_s"].apply(formatar_tempo)
+    df_ass["Tempo Total"] = df_ass["Tempo_Total_s"].apply(formatar_tempo)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -529,13 +631,11 @@ def secao_por_assunto(df):
         st.markdown("**TMA por Assunto (segundos)**")
         st.bar_chart(df_ass.set_index("assunto")["TMA_s"])
 
-    # Pareto
     st.markdown("**📊 Pareto — Assuntos que representam 80% do volume**")
     df_pareto = df_ass.copy()
     df_pareto["% Acumulado"] = (
         df_pareto["Atendimentos"].cumsum() / df_pareto["Atendimentos"].sum() * 100
     ).round(1)
-    df_pareto["Pareto 80%"] = df_pareto["% Acumulado"] <= 80
     st.dataframe(
         df_pareto[["assunto", "Atendimentos", "TMA", "Tempo Total", "% Acumulado"]],
         use_container_width=True
@@ -549,10 +649,11 @@ def secao_por_agente(df):
         st.info("Coluna de agente não encontrada.")
         return
 
-    tma_geral = df["duracao_segundos"].mean()
+    df_valido = df[df["nome_agente"].notna() & (df["nome_agente"].astype(str) != "nan")]
+    tma_geral = df_valido["duracao_segundos"].mean()
 
     df_ag = (
-        df.groupby("nome_agente", dropna=True)
+        df_valido.groupby("nome_agente", dropna=True)
         .agg(
             Atendimentos=("duracao_segundos", "count"),
             TMA_s=("duracao_segundos", "mean"),
@@ -561,26 +662,26 @@ def secao_por_agente(df):
         .reset_index()
         .sort_values("Atendimentos", ascending=False)
     )
-    df_ag["TMA"]          = df_ag["TMA_s"].apply(formatar_tempo)
-    df_ag["Tempo Total"]  = df_ag["Tempo_Total_s"].apply(formatar_tempo)
-    df_ag["Δ vs Média"]   = (df_ag["TMA_s"] - tma_geral).round(0).astype(int)
-    df_ag["Acima Média"]  = df_ag["Δ vs Média"] > 0
+    df_ag["TMA"]         = df_ag["TMA_s"].apply(formatar_tempo)
+    df_ag["Tempo Total"] = df_ag["Tempo_Total_s"].apply(formatar_tempo)
+    df_ag["Δ vs Média"]  = (df_ag["TMA_s"] - tma_geral).round(0).astype(int)
+    df_ag["Acima Média"] = df_ag["Δ vs Média"] > 0
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**🏆 Ranking por Volume de Atendimentos**")
+        st.markdown("**🏆 Ranking por Volume**")
         st.bar_chart(df_ag.set_index("nome_agente")["Atendimentos"])
     with col2:
         st.markdown("**⏱️ TMA por Agente (segundos)**")
         st.bar_chart(df_ag.set_index("nome_agente")["TMA_s"])
 
-    st.markdown("**📋 Tabela Comparativa — todos os agentes**")
+    st.markdown("**📋 Tabela Comparativa**")
     st.dataframe(
         df_ag[["nome_agente", "Atendimentos", "TMA", "Tempo Total", "Δ vs Média"]],
         use_container_width=True
     )
 
-    st.markdown("**🎯 Dispersão: Volume × TMA** — quadrantes de desempenho")
+    st.markdown("**🎯 Dispersão: Volume × TMA**")
     st.scatter_chart(
         df_ag,
         x="Atendimentos",
@@ -591,19 +692,21 @@ def secao_por_agente(df):
 
 
 def secao_detalhe_agente(df):
-    st.markdown('<h3 class="section-title">🔍 Detalhamento Individual do Agente</h3>', unsafe_allow_html=True)
+    st.markdown('<h3 class="section-title">🔍 Detalhamento Individual</h3>', unsafe_allow_html=True)
 
     if "nome_agente" not in df.columns:
         st.info("Coluna de agente não encontrada.")
         return
 
-    agentes = sorted(df["nome_agente"].dropna().unique())
+    agentes = sorted([
+        a for a in df["nome_agente"].dropna().unique()
+        if str(a) not in ("nan", "", "None")
+    ])
     agente_sel = st.selectbox(
         "Selecione o agente:",
         ["— Selecione —"] + list(agentes),
         key="sel_agente_detalhe"
     )
-
     if agente_sel == "— Selecione —":
         return
 
@@ -613,7 +716,7 @@ def secao_detalhe_agente(df):
     tma_ag         = df_ag["duracao_segundos"].mean()
     tma_geral      = df["duracao_segundos"].mean()
     total_horas_ag = df_ag["duracao_segundos"].sum() / 3600
-    pct_volume     = total_ag / len(df) * 100
+    pct_volume     = total_ag / len(df) * 100 if len(df) > 0 else 0
 
     col1, col2, col3, col4 = st.columns(4)
     with col1: card_metrica("Atendimentos", f"{total_ag:,}")
@@ -623,64 +726,68 @@ def secao_detalhe_agente(df):
 
     st.markdown(f"**⏰ Total em atendimento:** {total_horas_ag:.1f}h")
 
-    if "data_atendimento" in df_ag.columns:
+    if "data_atendimento" in df_ag.columns and df_ag["data_atendimento"].notna().any():
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown("**📈 Evolução do TMA por Dia**")
-            df_ag_tma = (
+            df_tma = (
                 df_ag.set_index("data_atendimento")
                 .resample("D")["duracao_segundos"]
                 .mean()
                 .reset_index()
                 .rename(columns={"duracao_segundos": "TMA (s)", "data_atendimento": "Data"})
             )
-            st.line_chart(df_ag_tma.set_index("Data"))
+            st.line_chart(df_tma.set_index("Data"))
 
         with col_b:
-            st.markdown("**📊 Volume de Atendimentos por Dia**")
-            df_ag_vol = (
+            st.markdown("**📊 Volume por Dia**")
+            df_vol = (
                 df_ag.set_index("data_atendimento")
                 .resample("D")["duracao_segundos"]
                 .count()
                 .reset_index()
                 .rename(columns={"duracao_segundos": "Atendimentos", "data_atendimento": "Data"})
             )
-            st.bar_chart(df_ag_vol.set_index("Data"))
+            st.bar_chart(df_vol.set_index("Data"))
 
+    # Assuntos do agente (só se cruzamento com Zendesk funcionou)
     if "assunto" in df_ag.columns and df_ag["assunto"].notna().any():
-        st.markdown("**🗂️ Assuntos atendidos por este agente**")
-        df_ag_ass = (
-            df_ag.groupby("assunto", dropna=True)
-            .agg(
-                Atendimentos=("duracao_segundos", "count"),
-                TMA_s=("duracao_segundos", "mean")
+        df_valido_ass = df_ag[df_ag["assunto"].astype(str) != "nan"]
+        if not df_valido_ass.empty:
+            st.markdown("**🗂️ Assuntos atendidos**")
+            df_ag_ass = (
+                df_valido_ass.groupby("assunto")
+                .agg(Atendimentos=("duracao_segundos", "count"), TMA_s=("duracao_segundos", "mean"))
+                .reset_index()
+                .sort_values("Atendimentos", ascending=False)
             )
-            .reset_index()
-            .sort_values("Atendimentos", ascending=False)
-        )
-        df_ag_ass["TMA"] = df_ag_ass["TMA_s"].apply(formatar_tempo)
+            df_ag_ass["TMA"] = df_ag_ass["TMA_s"].apply(formatar_tempo)
+            col_c, col_d = st.columns(2)
+            with col_c:
+                st.bar_chart(df_ag_ass.set_index("assunto")["Atendimentos"])
+            with col_d:
+                st.dataframe(df_ag_ass[["assunto", "Atendimentos", "TMA"]], use_container_width=True)
 
-        col_c, col_d = st.columns(2)
-        with col_c:
-            st.bar_chart(df_ag_ass.set_index("assunto")["Atendimentos"])
-        with col_d:
-            st.dataframe(df_ag_ass[["assunto", "Atendimentos", "TMA"]], use_container_width=True)
-
-    # Comparação agente × time
-    st.markdown("**⚖️ Comparação: este agente vs. média do time**")
-    comparativo = pd.DataFrame({
-        "Métrica": ["TMA (s)", "Atendimentos"],
-        agente_sel: [tma_ag, total_ag],
-        "Média do Time": [tma_geral, len(df) / df["nome_agente"].nunique()]
+    # Comparativo agente × time
+    st.markdown("**⚖️ Comparação: Agente vs. Média do Time**")
+    n_agentes = df["nome_agente"].nunique()
+    comp = pd.DataFrame({
+        "Métrica": ["TMA (segundos)", "Atendimentos", "% do Volume"],
+        agente_sel: [round(tma_ag, 0), total_ag, f"{pct_volume:.1f}%"],
+        "Média do Time": [
+            round(tma_geral, 0),
+            round(len(df) / n_agentes, 1) if n_agentes > 0 else "-",
+            f"{100/n_agentes:.1f}%" if n_agentes > 0 else "-"
+        ]
     })
-    st.dataframe(comparativo, use_container_width=True)
+    st.dataframe(comp, use_container_width=True)
 
-    # Tabela completa de atendimentos do agente
-    st.markdown("**📋 Todos os atendimentos no período selecionado**")
+    # Tabela completa dos atendimentos
+    st.markdown("**📋 Todos os atendimentos no período**")
     colunas_tabela = [c for c in [
         "data_atendimento", "ticket_id", "assunto",
-        "duracao_str", "duracao_segundos", "fila",
-        "ani", "tipo_desconexao", "id_genesys"
+        "duracao_str", "duracao_segundos",
+        "fila", "ani", "tipo_desconexao", "id_genesys"
     ] if c in df_ag.columns]
     st.dataframe(
         df_ag[colunas_tabela].sort_values("data_atendimento", ascending=False),
@@ -694,37 +801,51 @@ def secao_qualidade_dados(df):
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        sem_agente   = df["nome_agente"].isna().sum() if "nome_agente" in df.columns else 0
-        sem_duracao  = df["duracao_segundos"].isna().sum() if "duracao_segundos" in df.columns else 0
-        dur_zero     = (df["duracao_segundos"] == 0).sum() if "duracao_segundos" in df.columns else 0
-        st.metric("Sem nome de agente", sem_agente)
-        st.metric("Sem duração", sem_duracao)
-        st.metric("Duração zero", dur_zero)
+        st.markdown("**Genesys**")
+        sem_agente  = df["nome_agente"].isna().sum() if "nome_agente" in df.columns else 0
+        sem_duracao = df["duracao_segundos"].isna().sum() if "duracao_segundos" in df.columns else 0
+        dur_zero    = (df["duracao_segundos"] == 0).sum() if "duracao_segundos" in df.columns else 0
+        st.metric("Sem nome de agente", int(sem_agente))
+        st.metric("Sem duração", int(sem_duracao))
+        st.metric("Duração zero", int(dur_zero))
 
     with col2:
-        sem_assunto  = df["assunto"].isna().sum() if "assunto" in df.columns else "-"
-        sem_id       = df["id_genesys"].isna().sum() if "id_genesys" in df.columns else "-"
-        st.metric("Sem assunto (não cruzou Zendesk)", sem_assunto)
-        st.metric("Sem ID Genesys", sem_id)
+        st.markdown("**Zendesk (cruzamento)**")
+        sem_assunto = (
+            df["assunto"].isna().sum() + (df["assunto"].astype(str) == "nan").sum()
+            if "assunto" in df.columns else "-"
+        )
+        sem_id = (
+            df["id_genesys_norm"].isna().sum()
+            if "id_genesys_norm" in df.columns else "-"
+        )
+        st.metric("Sem assunto (não cruzou)", int(sem_assunto) if isinstance(sem_assunto, (int, float)) else sem_assunto)
+        st.metric("Sem ID Genesys", int(sem_id) if isinstance(sem_id, (int, float)) else sem_id)
 
     with col3:
-        if "duracao_segundos" in df.columns:
+        st.markdown("**Outliers de Duração**")
+        if "duracao_segundos" in df.columns and df["duracao_segundos"].notna().any():
+            q1  = df["duracao_segundos"].quantile(0.25)
             q3  = df["duracao_segundos"].quantile(0.75)
-            iqr = df["duracao_segundos"].quantile(0.75) - df["duracao_segundos"].quantile(0.25)
+            iqr = q3 - q1
             lim = q3 + 3 * iqr
             outliers = df[df["duracao_segundos"] > lim]
-            st.metric("Outliers de duração (> Q3+3×IQR)", len(outliers))
+            st.metric("Outliers (> Q3 + 3×IQR)", len(outliers))
             st.caption(f"Limite: {formatar_tempo(lim)}")
 
-    if "duracao_segundos" in df.columns:
+    # Tabela de outliers
+    if "duracao_segundos" in df.columns and df["duracao_segundos"].notna().any():
         q3  = df["duracao_segundos"].quantile(0.75)
-        iqr = df["duracao_segundos"].quantile(0.75) - df["duracao_segundos"].quantile(0.25)
+        iqr = q3 - q1
         lim = q3 + 3 * iqr
         outliers = df[df["duracao_segundos"] > lim]
         if not outliers.empty:
             st.markdown("**Atendimentos com duração muito acima do normal:**")
-            cols_out = [c for c in ["nome_agente", "data_atendimento", "duracao_str", "assunto"] if c in outliers.columns]
-            st.dataframe(outliers[cols_out].sort_values("duracao_segundos" if "duracao_segundos" in outliers.columns else cols_out[0], ascending=False).head(20), use_container_width=True)
+            cols_out = [c for c in ["nome_agente", "data_atendimento", "duracao_str", "assunto", "id_genesys"] if c in outliers.columns]
+            st.dataframe(
+                outliers[cols_out].sort_values("duracao_segundos" if "duracao_segundos" in outliers.columns else cols_out[0], ascending=False).head(20),
+                use_container_width=True
+            )
 
 
 # ─────────────────────────────────────────
@@ -735,29 +856,24 @@ def secao_upload():
     st.sidebar.header("📂 Upload Mensal")
     st.sidebar.markdown(
         "Suba os dois arquivos mensais. "
-        "Os dados são acumulados automaticamente a cada upload."
+        "Os dados são **acumulados automaticamente** a cada upload."
     )
 
     arq_zen = st.sidebar.file_uploader("Zendesk (XLSX)", type=["xlsx", "xls"], key="up_zen")
-    arq_gen = st.sidebar.file_uploader("Genesys (CSV)", type=["csv"], key="up_gen")
+    arq_gen = st.sidebar.file_uploader("Genesys (CSV)",  type=["csv"],         key="up_gen")
 
     if arq_zen and arq_gen:
         if st.sidebar.button("✅ Processar e Acumular", key="btn_proc"):
-            with st.spinner("Processando..."):
+            with st.spinner("Processando arquivos..."):
                 df_zen = carregar_zendesk(arq_zen)
                 df_gen = carregar_genesys(arq_gen)
-
-                if df_zen.empty and df_gen.empty:
-                    st.sidebar.error("Ambos os arquivos vieram vazios. Verifique os formatos.")
-                    return
-
                 df_novo = integrar_dados(df_zen, df_gen)
 
                 if df_novo.empty:
-                    st.sidebar.error("Nenhum dado gerado após o merge. Veja os avisos acima.")
+                    st.sidebar.error("Nenhum dado gerado. Veja os avisos acima.")
                     return
 
-                df_hist = carregar_historico()
+                df_hist     = carregar_historico()
                 df_acumulado = adicionar_ao_historico(df_novo, df_hist)
 
                 if salvar_historico(df_acumulado):
@@ -772,21 +888,20 @@ def secao_upload():
         if st.button("🗑️ Apagar todo o histórico", key="btn_apagar"):
             if os.path.exists(HISTORICO_PATH):
                 os.remove(HISTORICO_PATH)
-                st.success("Histórico apagado com sucesso.")
+                st.success("Histórico apagado.")
                 st.cache_data.clear()
                 st.rerun()
 
-    # Download do histórico completo
     if os.path.exists(HISTORICO_PATH):
         df_dl = carregar_historico()
         if not df_dl.empty:
             csv_bytes = df_dl.to_csv(index=False).encode("utf-8")
             st.sidebar.download_button(
-                label="⬇️ Baixar histórico completo (CSV)",
+                label="⬇️ Baixar histórico (CSV)",
                 data=csv_bytes,
                 file_name="historico_atendimentos.csv",
                 mime="text/csv",
-                key="btn_dl_hist"
+                key="btn_dl"
             )
 
 
@@ -797,8 +912,8 @@ def secao_upload():
 def main():
     st.title("📞 Dashboard de Atendimentos — Call Center")
     st.markdown(
-        "Análise consolidada de atendimentos **Zendesk + Genesys** | "
-        "Cruzamento por **ID de Conversa**"
+        "Análise consolidada **Zendesk + Genesys** | "
+        "Cruzamento por `ID Genesys` ↔ `ID de conversa`"
     )
 
     secao_upload()
@@ -808,14 +923,14 @@ def main():
     if df_hist.empty:
         st.info(
             "👆 Nenhum dado encontrado. "
-            "Faça o upload dos arquivos Zendesk e Genesys na barra lateral para começar."
+            "Faça o upload dos dois arquivos na barra lateral para começar."
         )
         return
 
     df_filtrado = aplicar_filtros(df_hist)
 
     if df_filtrado.empty:
-        st.warning("⚠️ Nenhum registro encontrado para os filtros selecionados.")
+        st.warning("⚠️ Nenhum registro para os filtros selecionados.")
         return
 
     aba1, aba2, aba3, aba4, aba5 = st.tabs([
@@ -826,16 +941,11 @@ def main():
         "🔧 Qualidade dos Dados"
     ])
 
-    with aba1:
-        secao_visao_geral(df_filtrado)
-    with aba2:
-        secao_por_assunto(df_filtrado)
-    with aba3:
-        secao_por_agente(df_filtrado)
-    with aba4:
-        secao_detalhe_agente(df_filtrado)
-    with aba5:
-        secao_qualidade_dados(df_filtrado)
+    with aba1: secao_visao_geral(df_filtrado)
+    with aba2: secao_por_assunto(df_filtrado)
+    with aba3: secao_por_agente(df_filtrado)
+    with aba4: secao_detalhe_agente(df_filtrado)
+    with aba5: secao_qualidade_dados(df_filtrado)
 
 
 if __name__ == "__main__":
