@@ -309,69 +309,120 @@ def secao_visao_geral(df):
 
     col_tma = _col_tma(df)
 
-    total_atend   = len(df)
-    tma_medio     = df[col_tma].mean() if col_tma in df.columns else np.nan
-    tempo_total   = df["duracao_segundos"].sum() if "duracao_segundos" in df.columns else 0
-    abandono_med  = df["abandono_segundos"].mean() if "abandono_segundos" in df.columns else np.nan
+    total        = len(df)
+    tma_medio    = df[col_tma].mean() if col_tma in df.columns else np.nan
+    dur_total    = df["duracao_segundos"].sum() if "duracao_segundos" in df.columns else 0
+    ura_medio    = df["ura_segundos"].mean() if "ura_segundos" in df.columns else np.nan
+    fila_medio   = df["fila_segundos"].mean() if "fila_segundos" in df.columns else np.nan
+    tpc_medio    = df["tpc_segundos"].mean() if "tpc_segundos" in df.columns else np.nan
+    trat_medio   = df["tratamento_segundos"].mean() if "tratamento_segundos" in df.columns else np.nan
+    aband_medio  = df["abandono_segundos"].mean() if "abandono_segundos" in df.columns else np.nan
 
+    # Linha 1 — volumes e tempos principais
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total de atendimentos", total_atend)
+    m1.metric("Total de atendimentos", total)
     m2.metric("TMA medio", formatar_tempo(tma_medio))
-    m3.metric("Tempo total em atendimento", formatar_tempo(tempo_total))
-    m4.metric("Tempo medio de abandono", formatar_tempo(abandono_med))
+    m3.metric("Tempo total em linha", formatar_tempo(dur_total))
+    m4.metric("Tempo medio em fila", formatar_tempo(fila_medio))
+
+    # Linha 2 — detalhamento de tempos
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("Tempo medio URA", formatar_tempo(ura_medio))
+    m6.metric("Tempo medio TPC", formatar_tempo(tpc_medio))
+    m7.metric("Tempo medio tratamento", formatar_tempo(trat_medio))
+    m8.metric("Tempo medio abandono", formatar_tempo(aband_medio))
 
     st.markdown("---")
 
-    # Volume diario
-    if "data_atendimento" in df.columns:
+    # Atendimentos por dia
+    if "data_atendimento" in df.columns and df["data_atendimento"].notna().any():
         df_dia = (
             df.set_index("data_atendimento")
             .resample("D")
             .size()
             .reset_index(name="atendimentos")
         )
-        df_dia["data_str"] = df_dia["data_atendimento"].dt.strftime("%d/%m/%Y")
-        fig = px.bar(
-            df_dia, x="data_str", y="atendimentos", text="atendimentos",
-            title="Volume diario de atendimentos",
-            labels={"data_str": "Data", "atendimentos": "Atendimentos"}
+        df_dia["data_atendimento"] = df_dia["data_atendimento"].dt.strftime("%d/%m/%Y")
+        fig_dia = px.bar(
+            df_dia, x="data_atendimento", y="atendimentos",
+            text="atendimentos",
+            title="Atendimentos por dia",
+            labels={"data_atendimento": "Data", "atendimentos": "Atendimentos"}
         )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(xaxis_tickangle=-30)
-        st.plotly_chart(fig, use_container_width=True)
+        fig_dia.update_traces(textposition="outside")
+        fig_dia.update_layout(xaxis_tickangle=-30)
+        st.plotly_chart(fig_dia, use_container_width=True)
 
     st.markdown("---")
 
-    # Tipo de desconexao geral
+    # Tipo de desconexao
     if "tipo_desconexao" in df.columns and df["tipo_desconexao"].notna().any():
         df_desc = df["tipo_desconexao"].dropna().value_counts().reset_index()
         df_desc.columns = ["tipo", "quantidade"]
-        df_desc["pct"] = (df_desc["quantidade"] / df_desc["quantidade"].sum() * 100).round(1)
-        df_desc["label"] = df_desc.apply(lambda r: f"{r['tipo']}<br>{r['quantidade']} ({r['pct']}%)", axis=1)
+        df_desc["percentual"] = (df_desc["quantidade"] / df_desc["quantidade"].sum() * 100).round(1)
+        df_desc["label"] = df_desc.apply(lambda r: f"{r['quantidade']} ({r['percentual']}%)", axis=1)
 
         c1, c2 = st.columns(2)
         with c1:
-            fig_d = px.pie(
+            fig_desc = px.pie(
                 df_desc, names="tipo", values="quantidade",
-                title="Tipos de desconexao",
-                hole=0.4
+                hole=0.4,
+                title="Distribuicao por tipo de desconexao"
             )
-            fig_d.update_traces(textinfo="label+percent")
-            st.plotly_chart(fig_d, use_container_width=True)
+            fig_desc.update_traces(textinfo="percent+label")
+            st.plotly_chart(fig_desc, use_container_width=True)
         with c2:
-            st.dataframe(df_desc[["tipo", "quantidade", "pct"]].rename(
-                columns={"tipo": "Tipo", "quantidade": "Qtd", "pct": "%"}
-            ), use_container_width=True)
+            st.markdown("**Detalhamento**")
+            st.dataframe(df_desc[["tipo", "quantidade", "percentual"]], use_container_width=True)
 
     st.markdown("---")
 
-    # Tempos medios por componente
+    # Atendimentos por agente
+    if "nome_agente" in df.columns and df["nome_agente"].notna().any():
+        df_ag = (
+            df[df["nome_agente"].notna()]
+            .groupby("nome_agente")
+            .agg(
+                atendimentos=(col_tma, "count"),
+                tma_s=(col_tma, "mean"),
+            )
+            .reset_index()
+            .sort_values("atendimentos", ascending=False)
+        )
+        df_ag["TMA"] = df_ag["tma_s"].apply(formatar_tempo)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_ag = px.bar(
+                df_ag, x="nome_agente", y="atendimentos",
+                text="atendimentos",
+                title="Atendimentos por agente",
+                labels={"nome_agente": "Agente", "atendimentos": "Atendimentos"}
+            )
+            fig_ag.update_traces(textposition="outside")
+            fig_ag.update_layout(xaxis_tickangle=-30)
+            st.plotly_chart(fig_ag, use_container_width=True)
+        with c2:
+            fig_tma = px.bar(
+                df_ag, x="nome_agente", y="tma_s",
+                text=df_ag["TMA"],
+                title="TMA por agente",
+                labels={"nome_agente": "Agente", "tma_s": "TMA (s)"}
+            )
+            fig_tma.update_traces(textposition="outside")
+            fig_tma.update_layout(xaxis_tickangle=-30)
+            st.plotly_chart(fig_tma, use_container_width=True)
+
+    st.markdown("---")
+
+    # Componentes de tempo medios gerais
     componentes = {
         "URA":        "ura_segundos",
         "Fila":       "fila_segundos",
         "Conversa":   "conversas_segundos",
         "TPC":        "tpc_segundos",
         "Tratamento": "tratamento_segundos",
+        "Abandono":   "abandono_segundos",
     }
     dados_comp = [
         {"componente": k, "media_s": df[v].mean()}
@@ -381,13 +432,59 @@ def secao_visao_geral(df):
     if dados_comp:
         df_comp = pd.DataFrame(dados_comp)
         df_comp["Tempo medio"] = df_comp["media_s"].apply(formatar_tempo)
-        fig_c = px.bar(
-            df_comp, x="componente", y="media_s", text="Tempo medio",
-            title="Tempo medio por componente da chamada",
+        fig_comp = px.bar(
+            df_comp, x="componente", y="media_s",
+            text="Tempo medio",
+            title="Tempo medio por componente (geral)",
             labels={"componente": "Componente", "media_s": "Segundos"}
         )
-        fig_c.update_traces(textposition="outside")
-        st.plotly_chart(fig_c, use_container_width=True)
+        fig_comp.update_traces(textposition="outside")
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+    st.markdown("---")
+
+    # Assuntos (se houver cruzamento com Zendesk)
+    if "assunto" in df.columns and df["assunto"].notna().any():
+        df_ass = (
+            df[df["assunto"].notna()]
+            .groupby("assunto")
+            .agg(
+                atendimentos=(col_tma, "count"),
+                tma_s=(col_tma, "mean"),
+                tempo_total_s=("duracao_segundos", "sum"),
+            )
+            .reset_index()
+            .sort_values("atendimentos", ascending=False)
+        )
+        df_ass["TMA"]         = df_ass["tma_s"].apply(formatar_tempo)
+        df_ass["Tempo Total"] = df_ass["tempo_total_s"].apply(formatar_tempo)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_ass = px.bar(
+                df_ass, x="assunto", y="atendimentos",
+                text="atendimentos",
+                title="Atendimentos por assunto",
+                labels={"assunto": "Assunto", "atendimentos": "Atendimentos"}
+            )
+            fig_ass.update_traces(textposition="outside")
+            fig_ass.update_layout(xaxis_tickangle=-30)
+            st.plotly_chart(fig_ass, use_container_width=True)
+        with c2:
+            fig_ass2 = px.bar(
+                df_ass, x="assunto", y="tma_s",
+                text=df_ass["TMA"],
+                title="TMA por assunto",
+                labels={"assunto": "Assunto", "tma_s": "TMA (s)"}
+            )
+            fig_ass2.update_traces(textposition="outside")
+            fig_ass2.update_layout(xaxis_tickangle=-30)
+            st.plotly_chart(fig_ass2, use_container_width=True)
+
+        st.dataframe(
+            df_ass[["assunto", "atendimentos", "TMA", "Tempo Total"]],
+            use_container_width=True
+        )
 
 
 # -------------------- Por Agente --------------------
