@@ -59,6 +59,13 @@ def corrigir_encoding_coluna(nome):
     except Exception:
         return nome
 
+def normalizar_nome_coluna(nome):
+    """Converte para minúsculo e remove acentos para comparação robusta."""
+    import unicodedata
+    nome = corrigir_encoding(nome).strip().lower()
+    return unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
+    
+
 # -------------------- Carregamento arquivos --------------------
 
 def carregar_zendesk(uploaded_file):
@@ -112,6 +119,7 @@ def carregar_genesys(uploaded_file):
                 "usuarios – interagiram":      "nome_agente",
                 "usuários - interagiram":      "nome_agente",
                 "usuarios - interagiram":      "nome_agente",
+                "usuarios interagiram":      "nome_agente",
                 "data":                        "data_atendimento_raw",
                 "duração":                     "duracao_str",
                 "duracao":                     "duracao_str",
