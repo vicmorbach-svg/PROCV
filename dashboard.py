@@ -4,6 +4,8 @@ import numpy as np
 import os
 import re
 import unicodedata
+import plotly.express as px
+import plotly.graph_objects as go
 
 HISTORICO_PATH = "historico_atendimentos.parquet"
 
@@ -52,24 +54,13 @@ def normalizar_id(valor):
     return match.group(0) if match else np.nan
 
 def normalizar_col(nome):
-    """
-    Recebe o nome de coluna como vem do openpyxl (pode ter encoding quebrado)
-    e devolve uma chave limpa: sem acento, minúsculo, sem caracteres especiais.
-    Ex: 'UsuÃ¡rios â€" Interagiram' -> 'usuarios  interagiram'
-    """
-    # 1. tenta corrigir latin-1 interpretado como utf-8
     try:
         nome = nome.encode("latin-1").decode("utf-8")
     except Exception:
         pass
-    # 2. remove acentos
     nome = unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
-    # 3. minúsculo e strip
     return nome.strip().lower()
 
-# -------------------- Carregamento Genesys --------------------
-
-# Mapa fixo: chave normalizada -> nome interno da coluna no dataframe
 MAPA_GENESYS = {
     "exportacao total concluida":  "exportacao",
     "filtros":                     "filtros",
@@ -86,61 +77,39 @@ MAPA_GENESYS = {
     "id de conversa":              "id_genesys",
 }
 
-# A coluna do agente tem encoding e traço variáveis; tratamos separado
-PADROES_AGENTE = re.compile(r"usu.{0,10}interagiram", re.IGNORECASE)
+PADRAO_AGENTE = re.compile(r"usu.{0,10}interagiram", re.IGNORECASE)
 
-
-def detectar_coluna_agente(colunas_originais):
-    """
-    Varre as colunas originais do XLSX procurando a que contém
-    'usu...interagiram' após normalização. Retorna o nome original ou None.
-    """
-    for col in colunas_originais:
-        normalizado = normalizar_col(col)
-        # após strip ascii, o en-dash vira espaço(s); usamos regex flexível
-        if PADROES_AGENTE.search(normalizado):
+def detectar_coluna_agente(colunas):
+    for col in colunas:
+        if PADRAO_AGENTE.search(normalizar_col(col)):
             return col
     return None
 
+# -------------------- Carregamento Genesys --------------------
 
 def carregar_genesys(uploaded_file):
     try:
-        nome_arquivo = uploaded_file.name.lower()
-
-        if not (nome_arquivo.endswith(".xlsx") or nome_arquivo.endswith(".xls")):
-            st.error("O arquivo Genesys deve ser XLSX.")
-            return pd.DataFrame()
-
         df_raw = pd.read_excel(uploaded_file, engine="openpyxl", dtype=str)
 
-        # --- mapeamento das colunas comuns ---
         renomear = {}
-        for col_orig in df_raw.columns:
-            chave = normalizar_col(col_orig)
+        for col in df_raw.columns:
+            chave = normalizar_col(col)
             if chave in MAPA_GENESYS:
-                renomear[col_orig] = MAPA_GENESYS[chave]
+                renomear[col] = MAPA_GENESYS[chave]
 
-        # --- detecta coluna do agente separadamente ---
-        col_agente_orig = detectar_coluna_agente(df_raw.columns)
-        if col_agente_orig:
-            renomear[col_agente_orig] = "nome_agente"
-            st.caption(f"Coluna de agente detectada: '{col_agente_orig}'")
+        col_agente = detectar_coluna_agente(df_raw.columns)
+        if col_agente:
+            renomear[col_agente] = "nome_agente"
         else:
-            st.warning(
-                "Coluna de agente não encontrada. "
-                f"Colunas disponíveis: {list(df_raw.columns)}"
-            )
+            st.warning(f"Coluna de agente não encontrada. Colunas: {list(df_raw.columns)}")
 
         df = df_raw.rename(columns=renomear)
 
-        # --- filtra apenas linhas exportadas com sucesso ---
         if "exportacao" in df.columns:
             mask = df["exportacao"].astype(str).str.strip().str.lower().isin(["sim", "yes"])
             df = df[mask].copy()
 
         df = df.reset_index(drop=True)
-
-        # --- pós-processamento ---
 
         # Fila
         if "filtros" in df.columns:
@@ -149,7 +118,8 @@ def carregar_genesys(uploaded_file):
                 .str.extract(r"Fila:\s*(.+)", expand=False)
                 .str.strip()
             )
-        df["fila"] = df.get("fila", pd.Series(["URA_CORSAN"] * len(df)))
+        if "fila" not in df.columns:
+            df["fila"] = "URA_CORSAN"
         df.loc[df["fila"].isna(), "fila"] = "URA_CORSAN"
 
         # Data
@@ -162,14 +132,12 @@ def carregar_genesys(uploaded_file):
         else:
             df["data_atendimento"] = pd.NaT
 
-        # Durações
-        if "duracao_str" in df.columns:
-            df["duracao_segundos"] = df["duracao_str"].apply(duracao_para_segundos)
-
+        # Durações em segundos
         for col_str, col_s in [
+            ("duracao_str",          "duracao_segundos"),
             ("total_ura_str",        "ura_segundos"),
             ("fila_total_str",       "fila_segundos"),
-            ("total_conversas_str",  "conversas_segundos"),
+            ("total_conversas_str",  "conversas_segundos"),   # <- TMA real
             ("total_tpc_str",        "tpc_segundos"),
             ("tratamento_total_str", "tratamento_segundos"),
             ("tempo_abandono_str",   "abandono_segundos"),
@@ -177,42 +145,39 @@ def carregar_genesys(uploaded_file):
             if col_str in df.columns:
                 df[col_s] = df[col_str].apply(duracao_para_segundos)
 
-        # ID de conversa
+        # ID conversa
         if "id_genesys" in df.columns:
             df["id_genesys_norm"] = df["id_genesys"].apply(normalizar_id)
         else:
             df["id_genesys_norm"] = np.nan
 
-        # ANI: remove prefixo tel:+
+        # ANI
         if "ani" in df.columns:
             df["ani"] = (
                 df["ani"].astype(str)
                 .str.replace(r"^tel:\+?", "", regex=True)
                 .str.strip()
             )
-            df.loc[df["ani"] == "nan", "ani"] = np.nan
+            df.loc[df["ani"].str.lower() == "nan", "ani"] = np.nan
 
-        # Nome do agente: limpa NaN literal e espaços
+        # Nome agente
         if "nome_agente" in df.columns:
             df["nome_agente"] = df["nome_agente"].astype(str).str.strip()
             df.loc[df["nome_agente"].str.lower().isin(["nan", ""]), "nome_agente"] = np.nan
         else:
             df["nome_agente"] = np.nan
 
-        total     = len(df)
         agentes_ok = df["nome_agente"].notna().sum()
-        ids_ok     = df["id_genesys_norm"].notna().sum() if "id_genesys_norm" in df.columns else 0
-
         st.info(
-            f"Genesys: {total} interações carregadas | "
-            f"{agentes_ok} com agente | {ids_ok} com ID de conversa"
+            f"Genesys: {len(df)} interações | "
+            f"{agentes_ok} com agente | "
+            f"{df['id_genesys_norm'].notna().sum()} com ID de conversa"
         )
         return df
 
     except Exception as e:
         st.error(f"Erro ao carregar Genesys: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+        import traceback; st.code(traceback.format_exc())
         return pd.DataFrame()
 
 # -------------------- Carregamento Zendesk --------------------
@@ -264,27 +229,29 @@ def integrar_dados(df_zen, df_gen):
         and df["id_genesys_norm"].notna().any()
     ):
         cols_zen = ["id_genesys_norm"] + [
-            c for c in ["ticket_id", "assunto", "matricula", "data_criacao_zen"]
+            c for c in ["ticket_id", "assunto", "matricula", "data_criacao_zen", "tickets_zen"]
             if c in df_zen.columns
         ]
         df_zen_slim = df_zen[cols_zen].drop_duplicates(subset=["id_genesys_norm"])
-        df = pd.merge(df, df_zen_slim, on="id_genesys_norm", how="left")
+        df = pd.merge(df, df_zen_slim, on="id_genesys_norm", how="left", suffixes=("", "_zen"))
 
         com_assunto = df["assunto"].notna().sum() if "assunto" in df.columns else 0
         st.success(
-            f"Merge: {len(df)} registros | {com_assunto} cruzados com Zendesk "
-            f"({com_assunto / len(df) * 100:.1f}%)"
+            f"Merge: {len(df)} registros | "
+            f"{com_assunto} cruzados com Zendesk ({com_assunto/len(df)*100:.1f}%)"
         )
     else:
+        st.warning("Zendesk não carregado ou sem ID para cruzar.")
         df["ticket_id"] = np.nan
         df["assunto"]   = np.nan
         df["matricula"] = np.nan
-        if df_zen.empty:
-            st.warning("Zendesk não carregado; exibindo só Genesys.")
-        else:
-            st.warning("ID de conversa não disponível para cruzar com Zendesk.")
 
-    df["data_base"] = df["data_atendimento"].copy()
+    df["data_base"] = pd.to_datetime(
+        df["data_atendimento"].dt.date if "data_atendimento" in df.columns else pd.NaT,
+        errors="coerce"
+    )
+    df["mes"] = df["data_base"].dt.to_period("M").astype(str)
+
     return df
 
 # -------------------- Histórico --------------------
@@ -295,12 +262,23 @@ def carregar_historico():
             df = pd.read_parquet(HISTORICO_PATH)
             if "data_base" in df.columns:
                 df["data_base"] = pd.to_datetime(df["data_base"], errors="coerce")
-            if "data_atendimento" in df.columns:
-                df["data_atendimento"] = pd.to_datetime(df["data_atendimento"], errors="coerce")
             return df
-        except Exception:
-            return pd.DataFrame()
+        except Exception as e:
+            st.warning(f"Erro ao carregar histórico: {e}")
     return pd.DataFrame()
+
+def adicionar_ao_historico(df_novo, df_hist):
+    if df_hist.empty:
+        return df_novo
+    chave = "id_genesys_norm"
+    if chave in df_novo.columns and chave in df_hist.columns:
+        ids_existentes = set(df_hist[chave].dropna().unique())
+        df_filtrado = df_novo[~df_novo[chave].isin(ids_existentes)]
+        duplicatas = len(df_novo) - len(df_filtrado)
+        if duplicatas:
+            st.info(f"{duplicatas} registro(s) duplicado(s) ignorado(s).")
+        return pd.concat([df_hist, df_filtrado], ignore_index=True)
+    return pd.concat([df_hist, df_novo], ignore_index=True)
 
 def salvar_historico(df):
     try:
@@ -310,82 +288,74 @@ def salvar_historico(df):
         st.error(f"Erro ao salvar histórico: {e}")
         return False
 
-def adicionar_ao_historico(df_novo, df_hist):
-    if df_hist.empty:
-        return df_novo.reset_index(drop=True)
-
-    df_comb = pd.concat([df_hist, df_novo], ignore_index=True)
-
-    if "id_genesys_norm" in df_comb.columns and df_comb["id_genesys_norm"].notna().any():
-        com_id = df_comb[df_comb["id_genesys_norm"].notna()]
-        sem_id = df_comb[df_comb["id_genesys_norm"].isna()]
-        com_id = com_id.drop_duplicates(subset=["id_genesys_norm"], keep="last")
-        df_comb = pd.concat([com_id, sem_id], ignore_index=True)
-    else:
-        chaves = [c for c in ["nome_agente", "data_atendimento", "duracao_segundos"] if c in df_comb.columns]
-        if chaves:
-            df_comb = df_comb.drop_duplicates(subset=chaves, keep="last")
-
-    return df_comb.reset_index(drop=True)
-
 # -------------------- Filtros --------------------
 
 def aplicar_filtros(df):
     st.sidebar.header("Filtros")
+
     df_f = df.copy()
 
     # Período
     if "data_base" in df_f.columns and df_f["data_base"].notna().any():
-        min_data = df_f["data_base"].min().date()
-        max_data = df_f["data_base"].max().date()
-        periodo  = st.sidebar.date_input(
-            "Período", value=(min_data, max_data),
-            min_value=min_data, max_value=max_data
-        )
-        if isinstance(periodo, (list, tuple)) and len(periodo) == 2:
-            ini, fim = periodo
+        datas_validas = df_f["data_base"].dropna()
+        d_min = datas_validas.min().date()
+        d_max = datas_validas.max().date()
+        intervalo = st.sidebar.date_input("Período", value=(d_min, d_max))
+        if isinstance(intervalo, (list, tuple)) and len(intervalo) == 2:
+            d_ini, d_fim = intervalo
             df_f = df_f[
-                (df_f["data_base"].dt.date >= ini) &
-                (df_f["data_base"].dt.date <= fim)
+                (df_f["data_base"].dt.date >= d_ini) &
+                (df_f["data_base"].dt.date <= d_fim)
             ]
 
     # Agente
-    if "nome_agente" in df_f.columns and df_f["nome_agente"].notna().any():
-        agentes    = sorted(df_f["nome_agente"].dropna().unique())
-        sel_agente = st.sidebar.multiselect("Agente", options=agentes, default=agentes)
-        if sel_agente:
-            df_f = df_f[df_f["nome_agente"].isin(sel_agente)]
+    if "nome_agente" in df_f.columns:
+        agentes = sorted(df_f["nome_agente"].dropna().unique())
+        sel_ag = st.sidebar.multiselect("Agente(s)", agentes)
+        if sel_ag:
+            df_f = df_f[df_f["nome_agente"].isin(sel_ag)]
+
+    # Fila
+    if "fila" in df_f.columns:
+        filas = sorted(df_f["fila"].dropna().unique())
+        sel_fila = st.sidebar.multiselect("Fila(s)", filas)
+        if sel_fila:
+            df_f = df_f[df_f["fila"].isin(sel_fila)]
 
     # Tipo de desconexão
-    if "tipo_desconexao" in df_f.columns and df_f["tipo_desconexao"].notna().any():
-        tipos    = sorted(df_f["tipo_desconexao"].dropna().unique())
-        sel_tipo = st.sidebar.multiselect("Tipo de desconexão", options=tipos, default=tipos)
+    if "tipo_desconexao" in df_f.columns:
+        tipos = sorted(df_f["tipo_desconexao"].dropna().unique())
+        sel_tipo = st.sidebar.multiselect("Tipo de desconexão", tipos)
         if sel_tipo:
             df_f = df_f[df_f["tipo_desconexao"].isin(sel_tipo)]
 
-    # Assunto (só aparece se Zendesk foi cruzado)
+    # Assunto
     if "assunto" in df_f.columns and df_f["assunto"].notna().any():
         assuntos = sorted(df_f["assunto"].dropna().unique())
-        sel_ass  = st.sidebar.multiselect("Assunto", options=assuntos, default=assuntos)
+        sel_ass = st.sidebar.multiselect("Assunto(s)", assuntos)
         if sel_ass:
             df_f = df_f[df_f["assunto"].isin(sel_ass)]
 
     st.sidebar.markdown(f"Registros no filtro: **{len(df_f)}**")
     return df_f
 
-# -------------------- Seções de visualização --------------------
+# -------------------- Seções --------------------
 
 def secao_visao_geral(df):
     st.subheader("Visão Geral")
 
-    total   = len(df)
-    tma     = df["duracao_segundos"].mean() if "duracao_segundos" in df.columns else None
-    horas   = df["duracao_segundos"].sum() / 3600 if "duracao_segundos" in df.columns else 0
+    # Métricas principais
+    # TMA = média de conversas_segundos (tempo real de conversa com o cliente)
+    col_tma = "conversas_segundos" if "conversas_segundos" in df.columns else "duracao_segundos"
+
+    total    = len(df)
+    tma      = df[col_tma].mean() if col_tma in df.columns else None
+    horas    = df["duracao_segundos"].sum() / 3600 if "duracao_segundos" in df.columns else 0
     n_agentes = df["nome_agente"].nunique() if "nome_agente" in df.columns else 0
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total de atendimentos", total)
-    col2.metric("TMA geral", formatar_tempo(tma))
+    col2.metric("TMA (tempo de conversa)", formatar_tempo(tma))
     col3.metric("Horas em atendimento", f"{horas:.1f} h")
     col4.metric("Agentes ativos", n_agentes)
 
@@ -393,6 +363,7 @@ def secao_visao_geral(df):
     cols_tempo = {
         "ura_segundos":        "Média URA",
         "fila_segundos":       "Média Fila",
+        "conversas_segundos":  "Média Conversa (TMA)",
         "tratamento_segundos": "Média Tratamento",
         "abandono_segundos":   "Média Abandono",
     }
@@ -403,14 +374,21 @@ def secao_visao_geral(df):
         for i, (label, col) in enumerate(disponiveis):
             cols_m[i].metric(label, formatar_tempo(df[col].mean()))
 
-    # Distribuição por tipo de desconexão
+    # Tipo de desconexão
     if "tipo_desconexao" in df.columns and df["tipo_desconexao"].notna().any():
         st.markdown("**Distribuição por tipo de desconexão**")
         dist = df["tipo_desconexao"].value_counts().reset_index()
         dist.columns = ["Tipo", "Qtd"]
-        st.bar_chart(dist.set_index("Tipo"))
+        fig = px.bar(
+            dist, x="Tipo", y="Qtd",
+            text="Qtd",
+            labels={"Qtd": "Atendimentos"}
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(uniformtext_minsize=10, uniformtext_mode="hide")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Atendimentos por dia
+    # Atendimentos por dia com valores nas barras
     if "data_base" in df.columns and df["data_base"].notna().any():
         df_dia = (
             df.set_index("data_base")
@@ -419,7 +397,16 @@ def secao_visao_geral(df):
             .reset_index(name="Atendimentos")
         )
         st.markdown("**Atendimentos por dia**")
-        st.line_chart(df_dia.set_index("data_base"))
+        fig2 = px.bar(
+            df_dia,
+            x="data_base",
+            y="Atendimentos",
+            text="Atendimentos",
+            labels={"data_base": "Data"}
+        )
+        fig2.update_traces(textposition="outside")
+        fig2.update_layout(uniformtext_minsize=9, uniformtext_mode="hide")
+        st.plotly_chart(fig2, use_container_width=True)
 
 
 def secao_por_agente(df):
@@ -429,9 +416,11 @@ def secao_por_agente(df):
         st.warning("Nenhum agente identificado nos dados.")
         return
 
+    col_tma = "conversas_segundos" if "conversas_segundos" in df.columns else "duracao_segundos"
+
     agg_dict = dict(
-        atendimentos=("duracao_segundos", "count"),
-        tma_s=("duracao_segundos", "mean"),
+        atendimentos=(col_tma, "count"),
+        tma_s=(col_tma, "mean"),
         tempo_total_s=("duracao_segundos", "sum"),
     )
     for col, alias in [("tratamento_segundos", "trat_s"), ("fila_segundos", "fila_s")]:
@@ -456,16 +445,28 @@ def secao_por_agente(df):
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Volume por agente**")
-        st.bar_chart(df_ag.set_index("nome_agente")["atendimentos"])
+        fig = px.bar(
+            df_ag, x="nome_agente", y="atendimentos",
+            text="atendimentos",
+            labels={"nome_agente": "Agente", "atendimentos": "Atendimentos"}
+        )
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
     with col2:
-        st.markdown("**TMA por agente (s)**")
-        st.bar_chart(df_ag.set_index("nome_agente")["tma_s"])
+        st.markdown("**TMA por agente**")
+        fig2 = px.bar(
+            df_ag, x="nome_agente", y="tma_s",
+            text=df_ag["TMA"],
+            labels={"nome_agente": "Agente", "tma_s": "TMA (s)"}
+        )
+        fig2.update_traces(textposition="outside")
+        st.plotly_chart(fig2, use_container_width=True)
 
     colunas_tabela = ["nome_agente", "atendimentos", "TMA", "Tempo Total"]
     for c in ["Trat. Médio", "Fila Média"]:
         if c in df_ag.columns:
             colunas_tabela.append(c)
-    st.dataframe(df_ag[colunas_tabela])
+    st.dataframe(df_ag[colunas_tabela], use_container_width=True)
 
 
 def secao_detalhe_agente(df):
@@ -475,15 +476,12 @@ def secao_detalhe_agente(df):
         st.warning("Nenhum agente identificado nos dados.")
         return
 
-    # Lista de agentes únicos ordenada alfabeticamente
+    col_tma = "conversas_segundos" if "conversas_segundos" in df.columns else "duracao_segundos"
+
     agentes    = sorted(df["nome_agente"].dropna().unique().tolist())
-    agente_sel = st.selectbox(
-        "Selecione o agente",
-        options=["(Selecione)"] + agentes
-    )
+    agente_sel = st.selectbox("Selecione o agente", ["(Selecione)"] + agentes)
 
     if agente_sel == "(Selecione)":
-        # Mostra a lista para o usuário saber quem está disponível
         st.info(f"{len(agentes)} agente(s) disponíveis: {', '.join(agentes)}")
         return
 
@@ -494,13 +492,13 @@ def secao_detalhe_agente(df):
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Atendimentos", len(df_ag))
-    col2.metric("TMA", formatar_tempo(df_ag["duracao_segundos"].mean()))
+    col2.metric("TMA (conversa)", formatar_tempo(df_ag[col_tma].mean()))
     col3.metric("Horas em atendimento", f"{df_ag['duracao_segundos'].sum() / 3600:.1f} h")
 
-    # Tempos médios do agente
     cols_tempo = {
         "ura_segundos":        "Média URA",
         "fila_segundos":       "Média Fila",
+        "conversas_segundos":  "TMA (conversa)",
         "tratamento_segundos": "Média Tratamento",
         "abandono_segundos":   "Média Abandono",
     }
@@ -510,7 +508,6 @@ def secao_detalhe_agente(df):
         for i, (label, col) in enumerate(disponiveis):
             cols_m[i].metric(label, formatar_tempo(df_ag[col].mean()))
 
-    # Atendimentos por dia do agente
     if "data_base" in df_ag.columns and df_ag["data_base"].notna().any():
         df_dia = (
             df_ag.set_index("data_base")
@@ -519,14 +516,19 @@ def secao_detalhe_agente(df):
             .reset_index(name="Atendimentos")
         )
         st.markdown("**Atendimentos por dia**")
-        st.line_chart(df_dia.set_index("data_base"))
+        fig = px.bar(
+            df_dia, x="data_base", y="Atendimentos",
+            text="Atendimentos",
+            labels={"data_base": "Data"}
+        )
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Tabela de atendimentos
     st.markdown("**Atendimentos detalhados**")
     cols_det = [
         "data_atendimento", "fila", "ani", "tipo_desconexao",
         "duracao_str", "total_ura_str", "fila_total_str",
-        "tratamento_total_str", "tempo_abandono_str",
+        "total_conversas_str", "tratamento_total_str", "tempo_abandono_str",
         "assunto", "ticket_id", "id_genesys",
     ]
     cols_det = [c for c in cols_det if c in df_ag.columns]
@@ -543,12 +545,14 @@ def secao_por_assunto(df):
         st.info("Ainda não há assuntos cruzados com o Zendesk.")
         return
 
+    col_tma = "conversas_segundos" if "conversas_segundos" in df.columns else "duracao_segundos"
+
     df_val = df[df["assunto"].notna()]
     df_ass = (
         df_val.groupby("assunto")
         .agg(
-            atendimentos=("duracao_segundos", "count"),
-            tma_s=("duracao_segundos", "mean"),
+            atendimentos=(col_tma, "count"),
+            tma_s=(col_tma, "mean"),
             tempo_total_s=("duracao_segundos", "sum"),
         )
         .reset_index()
@@ -560,12 +564,112 @@ def secao_por_assunto(df):
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Volume por assunto**")
-        st.bar_chart(df_ass.set_index("assunto")["atendimentos"])
+        fig = px.bar(df_ass, x="assunto", y="atendimentos", text="atendimentos")
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
     with col2:
-        st.markdown("**TMA por assunto (s)**")
-        st.bar_chart(df_ass.set_index("assunto")["tma_s"])
+        st.markdown("**TMA por assunto**")
+        fig2 = px.bar(df_ass, x="assunto", y="tma_s", text=df_ass["TMA"])
+        fig2.update_traces(textposition="outside")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    st.dataframe(df_ass[["assunto", "atendimentos", "TMA", "Tempo Total"]])
+    st.dataframe(df_ass[["assunto", "atendimentos", "TMA", "Tempo Total"]], use_container_width=True)
+
+
+def secao_top_assuntos_tma(df):
+    st.subheader("Top 10 assuntos por TMA — por mês")
+
+    if "assunto" not in df.columns or df["assunto"].isna().all():
+        st.info("Ainda não há assuntos cruzados com o Zendesk.")
+        return
+
+    if "mes" not in df.columns or df["mes"].isna().all():
+        st.info("Coluna de mês não disponível.")
+        return
+
+    col_tma = "conversas_segundos" if "conversas_segundos" in df.columns else "duracao_segundos"
+
+    meses_disponiveis = sorted(df["mes"].dropna().unique().tolist())
+    mes_sel = st.selectbox("Selecione o mês", meses_disponiveis)
+
+    df_mes = df[(df["mes"] == mes_sel) & df["assunto"].notna()]
+
+    if df_mes.empty:
+        st.info("Sem dados para este mês.")
+        return
+
+    df_top = (
+        df_mes.groupby("assunto")
+        .agg(
+            atendimentos=(col_tma, "count"),
+            tma_s=(col_tma, "mean"),
+        )
+        .reset_index()
+        .sort_values("tma_s", ascending=False)
+        .head(10)
+    )
+    df_top["TMA"] = df_top["tma_s"].apply(formatar_tempo)
+
+    st.markdown(f"**Top 10 assuntos com maior TMA em {mes_sel}**")
+
+    fig = px.bar(
+        df_top.sort_values("tma_s", ascending=True),
+        x="tma_s",
+        y="assunto",
+        orientation="h",
+        text="TMA",
+        labels={"tma_s": "TMA (s)", "assunto": "Assunto"},
+        color="tma_s",
+        color_continuous_scale="Reds",
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        coloraxis_showscale=False,
+        yaxis={"categoryorder": "total ascending"}
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        df_top[["assunto", "atendimentos", "TMA"]].reset_index(drop=True),
+        use_container_width=True
+    )
+
+    # Visão comparativa: todos os meses lado a lado
+    if len(meses_disponiveis) > 1:
+        st.markdown("**Comparativo entre meses — top assuntos por TMA**")
+
+        df_todos = (
+            df[df["assunto"].notna()]
+            .groupby(["mes", "assunto"])
+            .agg(tma_s=(col_tma, "mean"))
+            .reset_index()
+        )
+
+        # Para cada mês pega o top 10 e une
+        tops = []
+        for m in meses_disponiveis:
+            bloco = (
+                df_todos[df_todos["mes"] == m]
+                .sort_values("tma_s", ascending=False)
+                .head(10)
+            )
+            tops.append(bloco)
+        df_comp = pd.concat(tops, ignore_index=True)
+        df_comp["TMA"] = df_comp["tma_s"].apply(formatar_tempo)
+
+        fig2 = px.bar(
+            df_comp,
+            x="assunto",
+            y="tma_s",
+            color="mes",
+            barmode="group",
+            text="TMA",
+            labels={"tma_s": "TMA (s)", "assunto": "Assunto", "mes": "Mês"},
+        )
+        fig2.update_traces(textposition="outside")
+        fig2.update_layout(xaxis_tickangle=-30)
+        st.plotly_chart(fig2, use_container_width=True)
+
 
 # -------------------- Upload & main --------------------
 
@@ -582,14 +686,14 @@ def secao_upload():
             df_novo = integrar_dados(df_zen, df_gen)
 
             if df_novo.empty:
-                st.sidebar.error("Nenhum dado gerado. Veja as mensagens acima.")
+                st.sidebar.error("Nenhum dado gerado.")
                 return
 
             df_hist = carregar_historico()
             df_acum = adicionar_ao_historico(df_novo, df_hist)
             if salvar_historico(df_acum):
                 st.sidebar.success(
-                    f"Dados acumulados. Total histórico: {len(df_acum)} registros."
+                    f"Dados acumulados. Total: {len(df_acum)} registros."
                 )
                 st.rerun()
 
@@ -599,6 +703,7 @@ def secao_upload():
                 os.remove(HISTORICO_PATH)
                 st.success("Histórico apagado.")
                 st.rerun()
+
 
 def main():
     st.title("Dashboard de Atendimentos – Call Center")
@@ -615,13 +720,19 @@ def main():
         st.warning("Nenhum registro para os filtros atuais.")
         return
 
-    aba1, aba2, aba3, aba4 = st.tabs([
-        "Visão geral", "Por agente", "Detalhe do agente", "Por assunto"
+    aba1, aba2, aba3, aba4, aba5 = st.tabs([
+        "Visão geral",
+        "Por agente",
+        "Detalhe do agente",
+        "Por assunto",
+        "Top TMA por mês",
     ])
     with aba1: secao_visao_geral(df_filtrado)
     with aba2: secao_por_agente(df_filtrado)
     with aba3: secao_detalhe_agente(df_filtrado)
     with aba4: secao_por_assunto(df_filtrado)
+    with aba5: secao_top_assuntos_tma(df_filtrado)
+
 
 if __name__ == "__main__":
     main()
