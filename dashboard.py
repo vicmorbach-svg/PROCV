@@ -47,13 +47,16 @@ def normalizar_id(valor):
     if not s or s == "nan":
         return np.nan
     match = re.search(
-        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-        s
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', s
     )
     return match.group(0) if match else np.nan
 
-def corrigir_encoding_coluna(nome):
-    """Corrige nomes de colunas com encoding quebrado (latin-1 lido como utf-8)."""
+def corrigir_encoding(nome):
+    """
+    Colunas do Genesys chegam com encoding quebrado (latin-1 interpretado como utf-8).
+    Ex: 'UsuÃ¡rios â€" Interagiram' -> 'Usuários – Interagiram'
+    Tenta reencoder; se falhar, retorna o original.
+    """
     try:
         return nome.encode("latin-1").decode("utf-8")
     except Exception:
@@ -64,7 +67,6 @@ def normalizar_nome_coluna(nome):
     import unicodedata
     nome = corrigir_encoding(nome).strip().lower()
     return unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
-    
 
 # -------------------- Carregamento arquivos --------------------
 
@@ -107,39 +109,49 @@ def carregar_genesys(uploaded_file):
         # ---------- XLSX ----------
         if nome_arquivo.endswith(".xlsx") or nome_arquivo.endswith(".xls"):
             df_raw = pd.read_excel(uploaded_file, engine="openpyxl", dtype=str)
-            df_raw.columns = [corrigir_encoding_coluna(c.strip()) for c in df_raw.columns]
 
-            st.caption(f"Colunas encontradas no Genesys: {list(df_raw.columns)}")
-
-            mapa = {
-                "exportação total concluída":  "exportacao",
+            # Mapeia cada coluna original -> nome normalizado sem acento
+            # para que a comparação seja robusta independente do encoding
+            mapa_normalizado = {
                 "exportacao total concluida":  "exportacao",
                 "filtros":                     "filtros",
-                "usuários – interagiram":      "nome_agente",
+                "carimbo de data/hora do resultado parcial": "carimbo_parcial",
+                # agente — várias grafias possíveis após corrigir encoding
                 "usuarios – interagiram":      "nome_agente",
-                "usuários - interagiram":      "nome_agente",
                 "usuarios - interagiram":      "nome_agente",
-                "usuarios interagiram":      "nome_agente",
+                "usuarios  interagiram":       "nome_agente",
+                # data
                 "data":                        "data_atendimento_raw",
-                "duração":                     "duracao_str",
+                # duração
                 "duracao":                     "duracao_str",
+                # ani
                 "ani":                         "ani",
-                "tipo de desconexão":          "tipo_desconexao",
+                # tipo desconexão
                 "tipo de desconexao":          "tipo_desconexao",
+                # tempos
                 "total da ura":                "total_ura_str",
                 "fila total":                  "fila_total_str",
                 "total de conversas":          "total_conversas_str",
                 "total de tpc":                "total_tpc_str",
                 "tratamento total":            "tratamento_total_str",
                 "tempo para abandonar":        "tempo_abandono_str",
+                # id conversa
                 "id de conversa":              "id_genesys",
             }
 
-            renomear = {col: mapa[col.strip().lower()]
-                        for col in df_raw.columns
-                        if col.strip().lower() in mapa}
+            renomear = {}
+            for col_original in df_raw.columns:
+                chave = normalizar_nome_coluna(col_original)
+                if chave in mapa_normalizado:
+                    renomear[col_original] = mapa_normalizado[chave]
+
+            # Debug: mostra o mapeamento aplicado
+            st.caption(f"Colunas originais: {list(df_raw.columns)}")
+            st.caption(f"Mapeamento aplicado: {renomear}")
+
             df = df_raw.rename(columns=renomear)
 
+            # Filtra apenas linhas exportadas
             if "exportacao" in df.columns:
                 df = df[
                     df["exportacao"].astype(str).str.strip().str.lower().isin(["sim", "yes"])
@@ -173,6 +185,7 @@ def carregar_genesys(uploaded_file):
 
         # ---------- Pós-processamento comum ----------
 
+        # Fila
         if "filtros" in df.columns:
             df["fila"] = (
                 df["filtros"].astype(str)
@@ -183,6 +196,7 @@ def carregar_genesys(uploaded_file):
         else:
             df["fila"] = "URA_CORSAN"
 
+        # Data/hora
         if "data_atendimento_raw" in df.columns:
             df["data_atendimento"] = pd.to_datetime(
                 df["data_atendimento_raw"].astype(str).str.strip(),
@@ -192,9 +206,11 @@ def carregar_genesys(uploaded_file):
         else:
             df["data_atendimento"] = pd.NaT
 
+        # Duração total
         if "duracao_str" in df.columns:
             df["duracao_segundos"] = df["duracao_str"].apply(duracao_para_segundos)
 
+        # Tempos detalhados
         for col_str, col_s in [
             ("total_ura_str",        "ura_segundos"),
             ("fila_total_str",       "fila_segundos"),
@@ -206,6 +222,7 @@ def carregar_genesys(uploaded_file):
             if col_str in df.columns:
                 df[col_s] = df[col_str].apply(duracao_para_segundos)
 
+        # ID de conversa
         if "id_genesys" in df.columns:
             df["id_genesys_norm"] = df["id_genesys"].apply(normalizar_id)
             ids_ok = df["id_genesys_norm"].notna().sum()
@@ -214,6 +231,7 @@ def carregar_genesys(uploaded_file):
             df["id_genesys_norm"] = np.nan
             st.warning("Coluna 'ID de conversa' não encontrada no arquivo Genesys.")
 
+        # ANI: remove prefixo tel:+
         if "ani" in df.columns:
             df["ani"] = (
                 df["ani"].astype(str)
@@ -221,11 +239,20 @@ def carregar_genesys(uploaded_file):
                 .str.strip()
             )
 
+        # nome_agente: garante que existe e limpa NaN literal
+        if "nome_agente" in df.columns:
+            df["nome_agente"] = df["nome_agente"].astype(str).str.strip()
+            df.loc[df["nome_agente"].str.lower().isin(["nan", ""]), "nome_agente"] = np.nan
+        else:
+            st.warning("Coluna de agente não encontrada. Verifique o mapeamento acima.")
+            df["nome_agente"] = np.nan
+
         if df.empty:
             st.error("Nenhum registro válido encontrado no arquivo Genesys.")
             return pd.DataFrame()
 
-        st.info(f"Genesys: {len(df)} interações carregadas.")
+        agentes_encontrados = df["nome_agente"].notna().sum()
+        st.info(f"Genesys: {len(df)} interações carregadas, {agentes_encontrados} com agente identificado.")
         return df
 
     except Exception as e:
@@ -398,7 +425,6 @@ def secao_visao_geral(df):
         dist.columns = ["Tipo", "Qtd"]
         st.bar_chart(dist.set_index("Tipo"))
 
-    # Atendimentos por dia — usa .size() para evitar KeyError em colunas não numéricas
     if "data_base" in df.columns and df["data_base"].notna().any():
         df_dia = (
             df.set_index("data_base")
@@ -475,7 +501,6 @@ def secao_detalhe_agente(df):
     col2.metric("TMA do agente", formatar_tempo(df_ag["duracao_segundos"].mean()))
     col3.metric("Horas em atendimento", f"{df_ag['duracao_segundos'].sum() / 3600:.1f} h")
 
-    # Mesmo fix aqui: .size() em vez de ["coluna"].count()
     if "data_base" in df_ag.columns and df_ag["data_base"].notna().any():
         df_dia = (
             df_ag.set_index("data_base")
