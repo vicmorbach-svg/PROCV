@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import re
+import unicodedata
 
 HISTORICO_PATH = "historico_atendimentos.parquet"
 
@@ -40,7 +41,6 @@ def duracao_para_segundos(valor):
         return np.nan
 
 def normalizar_id(valor):
-    """Extrai UUID no padrão xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."""
     if pd.isna(valor):
         return np.nan
     s = str(valor).strip().lower()
@@ -51,22 +51,25 @@ def normalizar_id(valor):
     )
     return match.group(0) if match else np.nan
 
-def corrigir_encoding(nome):
+def normalizar_coluna(nome):
     """
-    Colunas do Genesys chegam com encoding quebrado (latin-1 interpretado como utf-8).
-    Ex: 'UsuÃ¡rios â€" Interagiram' -> 'Usuários – Interagiram'
-    Tenta reencoder; se falhar, retorna o original.
+    Transforma qualquer nome de coluna em chave comparável:
+    - corrige encoding latin-1/utf-8 quebrado
+    - remove acentos
+    - minúsculo
+    - strip
+    Assim 'UsuÃ¡rios â€" Interagiram' vira 'usuarios – interagiram'
+    e depois 'usuarios  interagiram' (sem acento, sem traço especial).
     """
+    # Tenta corrigir encoding quebrado (latin-1 lido como utf-8)
     try:
-        return nome.encode("latin-1").decode("utf-8")
+        nome = nome.encode("latin-1").decode("utf-8")
     except Exception:
-        return nome
-
-def normalizar_nome_coluna(nome):
-    """Converte para minúsculo e remove acentos para comparação robusta."""
-    import unicodedata
-    nome = corrigir_encoding(nome).strip().lower()
-    return unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
+        pass
+    # Remove acentos via NFKD
+    nome = unicodedata.normalize("NFKD", nome)
+    nome = nome.encode("ascii", "ignore").decode("ascii")
+    return nome.strip().lower()
 
 # -------------------- Carregamento arquivos --------------------
 
@@ -106,52 +109,54 @@ def carregar_genesys(uploaded_file):
     try:
         nome_arquivo = uploaded_file.name.lower()
 
-        # ---------- XLSX ----------
+        # ── XLSX ──────────────────────────────────────────────────────────────
         if nome_arquivo.endswith(".xlsx") or nome_arquivo.endswith(".xls"):
+
             df_raw = pd.read_excel(uploaded_file, engine="openpyxl", dtype=str)
 
-            # Mapeia cada coluna original -> nome normalizado sem acento
-            # para que a comparação seja robusta independente do encoding
-            mapa_normalizado = {
-                "exportacao total concluida":  "exportacao",
-                "filtros":                     "filtros",
+            # Mapa: chave normalizada → nome interno
+            # As chaves já estão sem acento e em minúsculo para bater com
+            # o resultado de normalizar_coluna(), independente do encoding
+            # original do arquivo.
+            mapa = {
+                "exportacao total concluida":            "exportacao",
                 "carimbo de data/hora do resultado parcial": "carimbo_parcial",
-                # agente — várias grafias possíveis após corrigir encoding
-                "usuarios – interagiram":      "nome_agente",
-                "usuarios - interagiram":      "nome_agente",
-                "usuarios  interagiram":       "nome_agente",
-                # data
-                "data":                        "data_atendimento_raw",
-                # duração
-                "duracao":                     "duracao_str",
-                # ani
-                "ani":                         "ani",
-                # tipo desconexão
-                "tipo de desconexao":          "tipo_desconexao",
-                # tempos
-                "total da ura":                "total_ura_str",
-                "fila total":                  "fila_total_str",
-                "total de conversas":          "total_conversas_str",
-                "total de tpc":                "total_tpc_str",
-                "tratamento total":            "tratamento_total_str",
-                "tempo para abandonar":        "tempo_abandono_str",
-                # id conversa
-                "id de conversa":              "id_genesys",
+                "filtros":                               "filtros",
+                # agente — traço pode ser hífen, en-dash ou virar espaço após strip ascii
+                "usuarios  interagiram":                 "nome_agente",
+                "usuarios - interagiram":                "nome_agente",
+                "usuarios -- interagiram":               "nome_agente",
+                "usuarios interagiram":                  "nome_agente",
+                "data":                                  "data_atendimento_raw",
+                "duracao":                               "duracao_str",
+                "ani":                                   "ani",
+                "tipo de desconexao":                    "tipo_desconexao",
+                "total da ura":                          "total_ura_str",
+                "fila total":                            "fila_total_str",
+                "total de conversas":                    "total_conversas_str",
+                "total de tpc":                          "total_tpc_str",
+                "tratamento total":                      "tratamento_total_str",
+                "tempo para abandonar":                  "tempo_abandono_str",
+                "id de conversa":                        "id_genesys",
             }
 
             renomear = {}
+            debug_cols = {}
             for col_original in df_raw.columns:
-                chave = normalizar_nome_coluna(col_original)
-                if chave in mapa_normalizado:
-                    renomear[col_original] = mapa_normalizado[chave]
+                chave = normalizar_coluna(col_original)
+                debug_cols[col_original] = chave
+                if chave in mapa:
+                    renomear[col_original] = mapa[chave]
 
-            # Debug: mostra o mapeamento aplicado
-            st.caption(f"Colunas originais: {list(df_raw.columns)}")
-            st.caption(f"Mapeamento aplicado: {renomear}")
+            # Mostra o diagnóstico para facilitar depuração futura
+            st.caption("Normalização de colunas (original → chave → destino):")
+            for orig, chave in debug_cols.items():
+                destino = renomear.get(orig, "— não mapeado —")
+                st.caption(f"  '{orig}'  →  '{chave}'  →  '{destino}'")
 
             df = df_raw.rename(columns=renomear)
 
-            # Filtra apenas linhas exportadas
+            # Filtra apenas linhas exportadas com sucesso
             if "exportacao" in df.columns:
                 df = df[
                     df["exportacao"].astype(str).str.strip().str.lower().isin(["sim", "yes"])
@@ -159,10 +164,10 @@ def carregar_genesys(uploaded_file):
 
             df = df.reset_index(drop=True)
 
-        # ---------- CSV legado (pipe) ----------
+        # ── CSV legado (pipe) ─────────────────────────────────────────────────
         else:
-            conteudo = uploaded_file.read().decode("utf-8", errors="replace")
-            linhas   = conteudo.splitlines()
+            conteudo  = uploaded_file.read().decode("utf-8", errors="replace")
+            linhas    = conteudo.splitlines()
             registros = []
             for linha in linhas:
                 linha = linha.strip()
@@ -183,7 +188,7 @@ def carregar_genesys(uploaded_file):
                 })
             df = pd.DataFrame(registros)
 
-        # ---------- Pós-processamento comum ----------
+        # ── Pós-processamento comum ───────────────────────────────────────────
 
         # Fila
         if "filtros" in df.columns:
@@ -239,20 +244,16 @@ def carregar_genesys(uploaded_file):
                 .str.strip()
             )
 
-        # nome_agente: garante que existe e limpa NaN literal
+        # Nome do agente: limpa NaN literal
         if "nome_agente" in df.columns:
             df["nome_agente"] = df["nome_agente"].astype(str).str.strip()
             df.loc[df["nome_agente"].str.lower().isin(["nan", ""]), "nome_agente"] = np.nan
         else:
-            st.warning("Coluna de agente não encontrada. Verifique o mapeamento acima.")
+            st.warning("Coluna de agente não encontrada após mapeamento.")
             df["nome_agente"] = np.nan
 
-        if df.empty:
-            st.error("Nenhum registro válido encontrado no arquivo Genesys.")
-            return pd.DataFrame()
-
-        agentes_encontrados = df["nome_agente"].notna().sum()
-        st.info(f"Genesys: {len(df)} interações carregadas, {agentes_encontrados} com agente identificado.")
+        agentes_ok = df["nome_agente"].notna().sum()
+        st.info(f"Genesys: {len(df)} interações carregadas, {agentes_ok} com agente identificado.")
         return df
 
     except Exception as e:
@@ -295,12 +296,7 @@ def integrar_dados(df_zen, df_gen):
         if df_zen.empty:
             st.warning("Zendesk não carregado; exibindo só dados do Genesys.")
         else:
-            motivo = []
-            if "id_genesys_norm" not in df.columns or df["id_genesys_norm"].isna().all():
-                motivo.append("IDs não encontrados no Genesys")
-            if "id_genesys_norm" not in df_zen.columns or df_zen["id_genesys_norm"].isna().all():
-                motivo.append("IDs não encontrados no Zendesk")
-            st.warning(f"Cruzamento não realizado: {'; '.join(motivo) if motivo else 'IDs não coincidem'}.")
+            st.warning("IDs não coincidem entre Genesys e Zendesk; sem cruzamento.")
         df["ticket_id"] = np.nan
         df["assunto"]   = np.nan
         df["matricula"] = np.nan
@@ -369,7 +365,7 @@ def aplicar_filtros(df):
                 (df_f["data_base"].dt.date <= fim)
             ]
 
-    if "nome_agente" in df_f.columns:
+    if "nome_agente" in df_f.columns and df_f["nome_agente"].notna().any():
         agentes    = sorted(df_f["nome_agente"].dropna().unique())
         sel_agente = st.sidebar.multiselect("Agente", options=agentes, default=agentes)
         if sel_agente:
@@ -415,9 +411,9 @@ def secao_visao_geral(df):
     disponiveis = {label: col for col, label in cols_tempo.items() if col in df.columns}
     if disponiveis:
         st.markdown("**Tempos médios detalhados**")
-        colunas_m = st.columns(len(disponiveis))
+        cols_m = st.columns(len(disponiveis))
         for i, (label, col) in enumerate(disponiveis.items()):
-            colunas_m[i].metric(label, formatar_tempo(df[col].mean()))
+            cols_m[i].metric(label, formatar_tempo(df[col].mean()))
 
     if "tipo_desconexao" in df.columns and df["tipo_desconexao"].notna().any():
         st.markdown("**Distribuição por tipo de desconexão**")
