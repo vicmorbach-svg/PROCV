@@ -40,29 +40,20 @@ def duracao_para_segundos(valor):
         return np.nan
 
 def normalizar_id(valor):
-    """
-    Normaliza UUIDs do tipo 3a0416be-7848-4614-8ee6-edc2af2577ff.
-    Extrai o padrão UUID mesmo que venha com espaços, prefixos ou casing diferente.
-    """
+    """Extrai UUID no padrão xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."""
     if pd.isna(valor):
         return np.nan
     s = str(valor).strip().lower()
     if not s or s == "nan":
         return np.nan
-    # Tenta extrair padrão UUID padrão (8-4-4-4-12 hex)
     match = re.search(
         r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
         s
     )
-    if match:
-        return match.group(0)
-    return np.nan
+    return match.group(0) if match else np.nan
 
 def corrigir_encoding_coluna(nome):
-    """
-    Corrige nomes de colunas que chegam com encoding quebrado (latin-1 lido como utf-8).
-    Ex: 'ExportaÃ§Ã£o' -> 'Exportação'
-    """
+    """Corrige nomes de colunas com encoding quebrado (latin-1 lido como utf-8)."""
     try:
         return nome.encode("latin-1").decode("utf-8")
     except Exception:
@@ -109,18 +100,13 @@ def carregar_genesys(uploaded_file):
         # ---------- XLSX ----------
         if nome_arquivo.endswith(".xlsx") or nome_arquivo.endswith(".xls"):
             df_raw = pd.read_excel(uploaded_file, engine="openpyxl", dtype=str)
-
-            # Corrige encoding quebrado nos nomes das colunas
             df_raw.columns = [corrigir_encoding_coluna(c.strip()) for c in df_raw.columns]
 
-            # Debug: mostra as colunas encontradas para facilitar diagnóstico
             st.caption(f"Colunas encontradas no Genesys: {list(df_raw.columns)}")
 
-            # Mapeamento flexível: chaves em minúsculo para comparação case-insensitive
             mapa = {
                 "exportação total concluída":  "exportacao",
                 "exportacao total concluida":  "exportacao",
-                "carimbo de data/hora do resultado parcial": "carimbo_parcial",
                 "filtros":                     "filtros",
                 "usuários – interagiram":      "nome_agente",
                 "usuarios – interagiram":      "nome_agente",
@@ -141,16 +127,11 @@ def carregar_genesys(uploaded_file):
                 "id de conversa":              "id_genesys",
             }
 
-            # Renomeia usando comparação em minúsculo
-            renomear = {}
-            for col in df_raw.columns:
-                chave = col.strip().lower()
-                if chave in mapa:
-                    renomear[col] = mapa[chave]
-
+            renomear = {col: mapa[col.strip().lower()]
+                        for col in df_raw.columns
+                        if col.strip().lower() in mapa}
             df = df_raw.rename(columns=renomear)
 
-            # Filtra apenas linhas onde exportacao == "Sim"
             if "exportacao" in df.columns:
                 df = df[
                     df["exportacao"].astype(str).str.strip().str.lower().isin(["sim", "yes"])
@@ -184,11 +165,9 @@ def carregar_genesys(uploaded_file):
 
         # ---------- Pós-processamento comum ----------
 
-        # Fila
         if "filtros" in df.columns:
             df["fila"] = (
-                df["filtros"]
-                .astype(str)
+                df["filtros"].astype(str)
                 .str.extract(r"Fila:\s*(.+)", expand=False)
                 .str.strip()
             )
@@ -196,7 +175,6 @@ def carregar_genesys(uploaded_file):
         else:
             df["fila"] = "URA_CORSAN"
 
-        # Data/hora
         if "data_atendimento_raw" in df.columns:
             df["data_atendimento"] = pd.to_datetime(
                 df["data_atendimento_raw"].astype(str).str.strip(),
@@ -206,11 +184,9 @@ def carregar_genesys(uploaded_file):
         else:
             df["data_atendimento"] = pd.NaT
 
-        # Duração total
         if "duracao_str" in df.columns:
             df["duracao_segundos"] = df["duracao_str"].apply(duracao_para_segundos)
 
-        # Tempos detalhados
         for col_str, col_s in [
             ("total_ura_str",        "ura_segundos"),
             ("fila_total_str",       "fila_segundos"),
@@ -222,7 +198,6 @@ def carregar_genesys(uploaded_file):
             if col_str in df.columns:
                 df[col_s] = df[col_str].apply(duracao_para_segundos)
 
-        # ID de conversa — normaliza extraindo UUID
         if "id_genesys" in df.columns:
             df["id_genesys_norm"] = df["id_genesys"].apply(normalizar_id)
             ids_ok = df["id_genesys_norm"].notna().sum()
@@ -231,11 +206,9 @@ def carregar_genesys(uploaded_file):
             df["id_genesys_norm"] = np.nan
             st.warning("Coluna 'ID de conversa' não encontrada no arquivo Genesys.")
 
-        # ANI: remove prefixo "tel:+" ou "tel:"
         if "ani" in df.columns:
             df["ani"] = (
-                df["ani"]
-                .astype(str)
+                df["ani"].astype(str)
                 .str.replace(r"^tel:\+?", "", regex=True)
                 .str.strip()
             )
@@ -348,21 +321,18 @@ def aplicar_filtros(df):
     if "data_base" in df_f.columns and df_f["data_base"].notna().any():
         min_data = df_f["data_base"].min().date()
         max_data = df_f["data_base"].max().date()
-        periodo  = st.sidebar.date_input("Período", value=(min_data, max_data),
-                                          min_value=min_data, max_value=max_data)
+        periodo  = st.sidebar.date_input(
+            "Período",
+            value=(min_data, max_data),
+            min_value=min_data,
+            max_value=max_data
+        )
         if isinstance(periodo, (list, tuple)) and len(periodo) == 2:
             ini, fim = periodo
             df_f = df_f[
                 (df_f["data_base"].dt.date >= ini) &
                 (df_f["data_base"].dt.date <= fim)
             ]
-
-    if "data_atendimento" in df_f.columns:
-        h_ini, h_fim = st.sidebar.slider("Hora do dia", 0, 23, (0, 23))
-        df_f = df_f[
-            (df_f["data_atendimento"].dt.hour >= h_ini) &
-            (df_f["data_atendimento"].dt.hour <= h_fim)
-        ]
 
     if "nome_agente" in df_f.columns:
         agentes    = sorted(df_f["nome_agente"].dropna().unique())
@@ -401,7 +371,6 @@ def secao_visao_geral(df):
     col3.metric("Horas em atendimento", f"{horas:.1f} h")
     col4.metric("Agentes ativos", agentes)
 
-    # Tempos médios detalhados
     cols_tempo = {
         "ura_segundos":        "Média URA",
         "fila_segundos":       "Média Fila",
@@ -421,13 +390,13 @@ def secao_visao_geral(df):
         dist.columns = ["Tipo", "Qtd"]
         st.bar_chart(dist.set_index("Tipo"))
 
-    if "data_base" in df.columns:
+    # Atendimentos por dia — usa .size() para evitar KeyError em colunas não numéricas
+    if "data_base" in df.columns and df["data_base"].notna().any():
         df_dia = (
             df.set_index("data_base")
-            .resample("D")["nome_agente"]
-            .count()
-            .reset_index()
-            .rename(columns={"nome_agente": "Atendimentos"})
+            .resample("D")
+            .size()
+            .reset_index(name="Atendimentos")
         )
         st.markdown("**Atendimentos por dia**")
         st.line_chart(df_dia.set_index("data_base"))
@@ -498,13 +467,13 @@ def secao_detalhe_agente(df):
     col2.metric("TMA do agente", formatar_tempo(df_ag["duracao_segundos"].mean()))
     col3.metric("Horas em atendimento", f"{df_ag['duracao_segundos'].sum() / 3600:.1f} h")
 
-    if "data_base" in df_ag.columns:
+    # Mesmo fix aqui: .size() em vez de ["coluna"].count()
+    if "data_base" in df_ag.columns and df_ag["data_base"].notna().any():
         df_dia = (
             df_ag.set_index("data_base")
-            .resample("D")["duracao_segundos"]
-            .count()
-            .reset_index()
-            .rename(columns={"duracao_segundos": "Atendimentos"})
+            .resample("D")
+            .size()
+            .reset_index(name="Atendimentos")
         )
         st.markdown("**Atendimentos por dia (agente)**")
         st.line_chart(df_dia.set_index("data_base"))
