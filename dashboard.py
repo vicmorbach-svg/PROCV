@@ -649,7 +649,7 @@ def secao_por_assunto(df):
     df_ass["TMA"]         = df_ass["tma_s"].apply(formatar_tempo)
     df_ass["Tempo Total"] = df_ass["tempo_total_s"].apply(formatar_tempo)
 
-    c1, c2 = st.columns(2)
+    c1, = st.columns(1)
     with c1:
         fig = px.bar(
             df_ass, x="assunto", y="atendimentos", text="atendimentos",
@@ -659,6 +659,8 @@ def secao_por_assunto(df):
         fig.update_traces(textposition="outside")
         fig.update_layout(xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True, key="ass_volume")
+
+    c2, = st.columns(1)
     with c2:
         fig2 = px.bar(
             df_ass, x="assunto", y="tma_s", text=df_ass["TMA"],
