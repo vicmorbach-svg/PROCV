@@ -776,39 +776,32 @@ def secao_top_assuntos_tma(df):
 def secao_upload():
     st.sidebar.header("Upload mensal")
 
-    arq_zen = st.sidebar.file_uploader("Zendesk (XLSX)", type=["xlsx", "xls"], key="upload_zen")
-    arq_gen = st.sidebar.file_uploader("Genesys (XLSX)", type=["xlsx", "xls"], key="upload_gen")
+    arq_zen = st.sidebar.file_uploader("Zendesk (XLSX)", type=["xlsx", "xls"])
+    arq_gen = st.sidebar.file_uploader("Genesys (XLSX)", type=["xlsx", "xls"])
 
-    # O botão de processar só é clicável se houver um arquivo Genesys
-    processar_button_disabled = arq_gen is None
+    if arq_gen is not None:
+        if st.sidebar.button("Processar e acumular"):
+            df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name) if arq_zen else pd.DataFrame()
+            df_gen = carregar_genesys(arq_gen.read(), arq_gen.name)
+            df_novo = integrar_dados(df_zen, df_gen)
 
-    if st.sidebar.button("Processar e acumular", key="btn_processar", disabled=processar_button_disabled):
-        if arq_gen is None: # Esta verificação é redundante com disabled=True, mas é um bom fallback
-            st.sidebar.warning("Por favor, carregue o arquivo Genesys para processar.")
-            return
+            if df_novo.empty:
+                st.sidebar.error("Nenhum dado gerado.")
+                return
 
-        df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name) if arq_zen else pd.DataFrame()
-        df_gen = carregar_genesys(arq_gen.read(), arq_gen.name)
-        df_novo = integrar_dados(df_zen, df_gen)
-
-        if df_novo.empty:
-            st.sidebar.error("Nenhum dado gerado.")
-            return
-
-        df_hist = carregar_historico()
-        df_acum = adicionar_ao_historico(df_novo, df_hist)
-        if salvar_historico(df_acum):
-            st.sidebar.success(f"Dados acumulados. Total: {len(df_acum)} registros.")
-            st.rerun()
+            df_hist = carregar_historico()
+            df_acum = adicionar_ao_historico(df_novo, df_hist)
+            if salvar_historico(df_acum):
+                st.sidebar.success(f"Dados acumulados. Total: {len(df_acum)} registros.")
+                st.rerun()
 
     with st.sidebar.expander("Gerenciar historico"):
-        if st.button("Apagar historico", key="btn_apagar_hist"):
+        if st.button("Apagar historico"):
             if os.path.exists(HISTORICO_PATH):
                 os.remove(HISTORICO_PATH)
                 carregar_historico.clear()
                 st.success("Historico apagado.")
                 st.rerun()
-
 
 def main():
     st.title("Dashboard de Atendimentos - Call Center")
