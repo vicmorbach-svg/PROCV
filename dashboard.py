@@ -779,21 +779,26 @@ def secao_upload():
     arq_zen = st.sidebar.file_uploader("Zendesk (XLSX)", type=["xlsx", "xls"], key="upload_zen")
     arq_gen = st.sidebar.file_uploader("Genesys (XLSX)", type=["xlsx", "xls"], key="upload_gen")
 
-    if arq_gen is not None:
-        if st.sidebar.button("Processar e acumular", key="btn_processar"):
-            df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name) if arq_zen else pd.DataFrame()
-            df_gen = carregar_genesys(arq_gen.read(), arq_gen.name)
-            df_novo = integrar_dados(df_zen, df_gen)
+    # O botão de processar deve aparecer sempre que houver um arquivo Genesys
+    # para que o usuário possa iniciar o processo.
+    if st.sidebar.button("Processar e acumular", key="btn_processar"):
+        if arq_gen is None:
+            st.sidebar.warning("Por favor, carregue o arquivo Genesys (XLSX) para processar.")
+            return
 
-            if df_novo.empty:
-                st.sidebar.error("Nenhum dado gerado.")
-                return
+        df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name) if arq_zen else pd.DataFrame()
+        df_gen = carregar_genesys(arq_gen.read(), arq_gen.name)
+        df_novo = integrar_dados(df_zen, df_gen)
 
-            df_hist = carregar_historico()
-            df_acum = adicionar_ao_historico(df_novo, df_hist)
-            if salvar_historico(df_acum):
-                st.sidebar.success(f"Dados acumulados. Total: {len(df_acum)} registros.")
-                st.rerun()
+        if df_novo.empty:
+            st.sidebar.error("Nenhum dado gerado.")
+            return
+
+        df_hist = carregar_historico()
+        df_acum = adicionar_ao_historico(df_novo, df_hist)
+        if salvar_historico(df_acum):
+            st.sidebar.success(f"Dados acumulados. Total: {len(df_acum)} registros.")
+            st.rerun()
 
     with st.sidebar.expander("Gerenciar historico"):
         if st.button("Apagar historico", key="btn_apagar_hist"):
