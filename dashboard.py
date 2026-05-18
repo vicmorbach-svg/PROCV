@@ -393,7 +393,7 @@ def secao_visao_geral(df):
 
     st.markdown("---")
 
-    c1, c2 = st.columns(2)
+    c1, = st.columns(1)
 
     # Pizza tipo de desconexao
     with c1:
@@ -408,6 +408,7 @@ def secao_visao_geral(df):
             fig_desc.update_traces(textinfo="label+percent")
             st.plotly_chart(fig_desc, use_container_width=True, key="vg_desconexao")
 
+    c2, = st.columns(1)
     # Atendimentos por agente
     with c2:
         if "nome_agente" in df.columns and df["nome_agente"].notna().any():
@@ -500,7 +501,7 @@ def secao_por_agente(df):
     df_ag["TMA"]         = df_ag["tma_s"].apply(formatar_tempo)
     df_ag["Tempo Total"] = df_ag["tempo_total_s"].apply(formatar_tempo)
 
-    c1, c2 = st.columns(2)
+    c1, = st.columns(1)
     with c1:
         fig = px.bar(
             df_ag, x="nome_agente", y="atendimentos", text="atendimentos",
@@ -510,6 +511,8 @@ def secao_por_agente(df):
         fig.update_traces(textposition="outside")
         fig.update_layout(xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True, key="pa_atendimentos")
+
+    c2, = st.columns(1)
     with c2:
         fig2 = px.bar(
             df_ag, x="nome_agente", y="tma_s", text=df_ag["TMA"],
