@@ -779,11 +779,11 @@ def secao_upload():
     arq_zen = st.sidebar.file_uploader("Zendesk (XLSX)", type=["xlsx", "xls"], key="upload_zen")
     arq_gen = st.sidebar.file_uploader("Genesys (XLSX)", type=["xlsx", "xls"], key="upload_gen")
 
-    # O botão de processar só deve estar ativo se houver um arquivo Genesys
-    processar_disabled = arq_gen is None
+    # O botão de processar só é clicável se houver um arquivo Genesys
+    processar_button_disabled = arq_gen is None
 
-    if st.sidebar.button("Processar e acumular", key="btn_processar", disabled=processar_disabled):
-        if arq_gen is None:
+    if st.sidebar.button("Processar e acumular", key="btn_processar", disabled=processar_button_disabled):
+        if arq_gen is None: # Esta verificação é redundante com disabled=True, mas é um bom fallback
             st.sidebar.warning("Por favor, carregue o arquivo Genesys para processar.")
             return
 
