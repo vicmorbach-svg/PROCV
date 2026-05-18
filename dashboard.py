@@ -8,7 +8,7 @@ import gc
 import plotly.express as px
 from io import BytesIO
 
-HISTORICO_PATH = "historico_atendimentos.parquet"
+HISTORICO_PATH = "data/historico_atendimentos.parquet"
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
 
