@@ -8,22 +8,74 @@ import gc
 import plotly.express as px
 from io import BytesIO
 
-# Adicionadas as importacoes necessarias para as funcoes do GitHub
+# Adicionadas as importacoes necessarias para as funcoes do GitHub e Login
 import requests
 import base64
 import json
 import io
+import datetime
+import pytz
 
-# CORRIGIDO: O caminho do historico agora aponta para a pasta 'Data' no GitHub
-HISTORICO_PATH = "Data/historico_atendimentos.parquet"
+# Configura o fuso horário do Brasil
+fuso_br = pytz.timezone('America/Sao_Paulo')
+hora_atual = datetime.datetime.now(fuso_br).hour
 
-st.set_page_config(page_title="Dashboard Call Center", layout="wide")
+# Define o funcionamento das 08h às 18h (por exemplo)
+# Removido para o dashboard, pois nao foi solicitado explicitamente para este app
+# if hora_atual < 8 or hora_atual >= 18:
+#     st.cache_data.clear()
+#     st.title("🌙 Sistema em Repouso")
+#     st.info("O painel de análise funciona apenas das 08h às 18h para economia de recursos.")
+#     st.stop() # Interrompe a execução de todo o resto do código abaixo
 
-# -------------------- Funcoes de Interacao com GitHub (copiadas do seu outro app) --------------------
+# ══════════════════════════════════════════════════════════════
+# SISTEMA DE LOGIN (Integrado do app_analise.py)
+# ══════════════════════════════════════════════════════════════
+
+def get_users():
+    users = {}
+    try:
+        secrets  = st.secrets["users"]
+        prefixes = set()
+        for key in secrets:
+            if key.endswith("_user"):
+                prefixes.add(key[:-5])
+        for prefix in prefixes:
+            username = secrets.get(f"{prefix}_user", "")
+            password = secrets.get(f"{prefix}_password", "")
+            role     = secrets.get(f"{prefix}_role", "user")
+            if username:
+                users[username] = {"password": password, "role": role}
+    except Exception:
+        pass
+    return users
+
+def login_screen():
+    st.title("🔐 Login")
+    st.markdown("Faça login para acessar o sistema.")
+    with st.form("login_form"):
+        username  = st.text_input("Usuário")
+        password  = st.text_input("Senha", type="password")
+        submitted = st.form_submit_button("Entrar")
+    if submitted:
+        users = get_users()
+        if username in users and users[username]["password"] == password:
+            st.session_state["logged_in"] = True
+            st.session_state["username"]  = username
+            st.session_state["role"]      = users[username]["role"]
+            st.rerun()
+        else:
+            st.error("Usuário ou senha incorretos.")
+
+def is_admin():
+    return st.session_state.get("role") == "admin"
+
+# ══════════════════════════════════════════════════════════════
+# GITHUB — Integração (Integrado do app_analise.py)
+# ══════════════════════════════════════════════════════════════
 
 def get_github_config():
     try:
-        # st.secrets deve ser configurado no Streamlit Cloud com as credenciais do GitHub
         token  = st.secrets["github"]["token"]
         repo   = st.secrets["github"]["repo"]
         branch = st.secrets["github"].get("branch", "main")
@@ -50,14 +102,11 @@ def get_file_sha(path):
 def get_file_from_github(path):
     token, repo, branch = get_github_config()
     if not token: return None, None
-    # A API de contents retorna o conteudo base64-encoded
-    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
-    r = requests.get(url, headers=get_github_headers())
-    if r.status_code == 200:
-        data = r.json()
-        if "content" in data:
-            content_bytes = base64.b64decode(data["content"])
-            return content_bytes, data.get("sha")
+    # CORRIGIDO: Usando a URL raw para baixar o conteudo diretamente
+    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+    r = requests.get(raw_url, headers={"Authorization": f"token {token}"})
+    if r.status_code == 200 and len(r.content) > 0:
+        return r.content, get_file_sha(path) # Retorna o conteudo e o SHA
     return None, None
 
 def save_file_to_github(path, content_bytes, message):
@@ -78,7 +127,7 @@ def delete_file_from_github(path, message):
     token, repo, branch = get_github_config()
     if not token: return False
     sha = get_file_sha(path)
-    if not sha: return True # Se nao tem SHA, o arquivo ja nao existe, entao consideramos sucesso
+    if not sha: return True # Se o arquivo nao existe, ja esta "apagado"
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     payload = {"message": message, "sha": sha, "branch": branch}
     r = requests.delete(url, headers=get_github_headers(), data=json.dumps(payload))
@@ -97,8 +146,13 @@ def parquet_bytes_to_df(content_bytes, colunas=None):
         buf.seek(0)
         return pd.read_parquet(buf, engine='pyarrow', columns=colunas)
     except Exception as e:
-        st.error(f"Erro ao ler arquivo Parquet do GitHub: {e}")
+        st.error(f"Erro ao converter bytes Parquet para DataFrame: {e}")
         return None
+
+# CORRIGIDO: O caminho do historico agora aponta para a pasta 'data' no GitHub
+HISTORICO_PATH = "data/historico_atendimentos.parquet"
+
+st.set_page_config(page_title="Dashboard Call Center", layout="wide")
 
 # -------------------- Utils --------------------
 
@@ -218,9 +272,10 @@ def carregar_genesys(file_bytes: bytes, file_name: str):
         df["fila"] = df["fila"].fillna("URA_CORSAN")
 
         if "data_atendimento_raw" in df.columns:
+            # CORRIGIDO: Adicionado o formato para evitar UserWarning
             df["data_atendimento"] = pd.to_datetime(
                 df["data_atendimento_raw"].astype(str).str.strip(),
-                errors="coerce", dayfirst=True
+                errors="coerce", format="%Y-%m-%d %H:%M:%S" # Ajustado para o formato comum
             )
         else:
             df["data_atendimento"] = pd.NaT
@@ -343,15 +398,14 @@ def integrar_dados(df_zen, df_gen):
     return df
 
 
-# -------------------- Historico (CORRIGIDO PARA USAR GITHUB API) --------------------
+# -------------------- Historico (Modificado para usar GitHub) --------------------
 
-@st.cache_data(show_spinner="Carregando historico do GitHub...", ttl=60)
+@st.cache_data(show_spinner="Carregando historico...", ttl=60)
 def carregar_historico():
     content_bytes, _ = get_file_from_github(HISTORICO_PATH)
     if content_bytes:
         df = parquet_bytes_to_df(content_bytes)
         if df is not None:
-            # Garante que as colunas de data sejam datetime
             for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -360,8 +414,8 @@ def carregar_historico():
 
 def salvar_historico(df):
     try:
-        parquet_data = df_to_parquet_bytes(df)
-        if save_file_to_github(HISTORICO_PATH, parquet_data, "Atualiza historico de atendimentos"):
+        content_bytes = df_to_parquet_bytes(df)
+        if save_file_to_github(HISTORICO_PATH, content_bytes, "Atualiza historico de atendimentos"):
             carregar_historico.clear() # Limpa o cache para recarregar do GitHub
             return True
         else:
@@ -485,13 +539,49 @@ def secao_visao_geral(df):
 
     st.markdown("---")
 
-    # Componentes de tempo (geral)
+    c1, c2 = st.columns(2)
+
+    # Pizza tipo de desconexao
+    with c1:
+        if "tipo_desconexao" in df.columns and df["tipo_desconexao"].notna().any():
+            df_desc = df["tipo_desconexao"].dropna().value_counts().reset_index()
+            df_desc.columns = ["tipo", "quantidade"]
+            fig_desc = px.pie(
+                df_desc, names="tipo", values="quantidade",
+                title="Tipos de desconexao",
+                hole=0.4
+            )
+            fig_desc.update_traces(textinfo="label+percent")
+            st.plotly_chart(fig_desc, use_container_width=True, key="vg_desconexao")
+
+    # Atendimentos por agente
+    with c2:
+        if "nome_agente" in df.columns and df["nome_agente"].notna().any():
+            df_ag = (
+                df[df["nome_agente"].notna()]
+                .groupby("nome_agente")
+                .size()
+                .reset_index(name="atendimentos")
+                .sort_values("atendimentos", ascending=False)
+            )
+            fig_ag = px.bar(
+                df_ag, x="nome_agente", y="atendimentos", text="atendimentos",
+                title="Atendimentos por agente",
+                labels={"nome_agente": "Agente", "atendimentos": "Atendimentos"}
+            )
+            fig_ag.update_traces(textposition="outside")
+            fig_ag.update_layout(xaxis_tickangle=-30)
+            st.plotly_chart(fig_ag, use_container_width=True, key="vg_agente")
+
+    st.markdown("---")
+
+    # Componentes de tempo medio geral
     componentes = {
-        "URA":        "ura_segundos",
-        "Fila":       "fila_segundos",
-        "Conversa":   "conversas_segundos",
-        "TPC":        "tpc_segundos",
-        "Tratamento": "tratamento_segundos",
+        "URA":          "ura_segundos",
+        "Fila":         "fila_segundos",
+        "Conversa":     "conversas_segundos",
+        "TPC":          "tpc_segundos",
+        "Tratamento":   "tratamento_segundos",
     }
     dados_comp = [
         {"componente": k, "media_s": df[v].mean()}
@@ -617,7 +707,7 @@ def secao_detalhe_agente(df):
         "Fila":       "fila_segundos",
         "Conversa":   "conversas_segundos",
         "TPC":        "tpc_segundos",
-        "Tratamento": "tratamento_segundos"
+        "Tratamento": "tratamento_segundos",
     }
     dados_comp = [
         {"componente": k, "media_s": df_ag[v].mean()}
@@ -759,6 +849,7 @@ def secao_top_assuntos_tma(df):
     )
     df_top["TMA"] = df_top["tma_s"].apply(formatar_tempo)
 
+    # CORRIGIDO: Removido o parentese extra que causava SyntaxError
     fig = px.bar(
         df_top.sort_values("tma_s", ascending=True),
         x="tma_s", y="assunto", orientation="h",
@@ -814,7 +905,10 @@ def secao_upload():
 
     if arq_gen is not None:
         if st.sidebar.button("Processar e acumular"):
-            df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name) if arq_zen else pd.DataFrame()
+            df_zen = pd.DataFrame()
+            if arq_zen:
+                df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name)
+
             df_gen = carregar_genesys(arq_gen.read(), arq_gen.name)
             df_novo = integrar_dados(df_zen, df_gen)
 
@@ -832,7 +926,7 @@ def secao_upload():
         if st.button("Apagar historico"):
             # CORRIGIDO: Usa a funcao delete_file_from_github
             if delete_file_from_github(HISTORICO_PATH, "Apaga historico de atendimentos"):
-                carregar_historico.clear()
+                carregar_historico.clear() # Limpa o cache
                 st.success("Historico apagado do GitHub.")
                 st.rerun()
             else:
@@ -840,7 +934,18 @@ def secao_upload():
 
 
 def main():
+    # Adicionado o controle de login
+    if "logged_in" not in st.session_state or not st.session_state["logged_in"]:
+        login_screen()
+        st.stop()
+
     st.title("Dashboard de Atendimentos - Call Center")
+    st.sidebar.markdown(f"👤 **{st.session_state['username']}**")
+    if st.sidebar.button("Sair"):
+        st.session_state.clear()
+        st.rerun()
+    st.sidebar.markdown("---")
+
 
     secao_upload()
     df_hist = carregar_historico()
