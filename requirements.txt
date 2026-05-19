@@ -7,3 +7,4 @@ openpyxl # Para ler arquivos .xlsx
 holidays # Nova dependência para feriados
 xlsxwriter
 requests
+pytz
