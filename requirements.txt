@@ -6,3 +6,4 @@ scipy # Para funções estatísticas, se precisarmos de uma implementação mais
 openpyxl # Para ler arquivos .xlsx
 holidays # Nova dependência para feriados
 xlsxwriter
+requests
