@@ -31,7 +31,7 @@ if hora_atual < 8 or hora_atual >= 18:
 # SISTEMA DE LOGIN (Integrado do app_analise.py)
 # ══════════════════════════════════════════════════════════════
 
-def get_users():
+#def get_users():
     users = {}
     try:
         secrets  = st.secrets["users"]
@@ -49,7 +49,7 @@ def get_users():
         pass
     return users
 
-def login_screen():
+#def login_screen():
     st.title("🔐 Login")
     st.markdown("Faça login para acessar o sistema.")
     with st.form("login_form"):
@@ -66,7 +66,7 @@ def login_screen():
         else:
             st.error("Usuário ou senha incorretos.")
 
-def is_admin():
+#def is_admin():
     return st.session_state.get("role") == "admin"
 
 # ══════════════════════════════════════════════════════════════
