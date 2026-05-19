@@ -268,9 +268,7 @@ def normalizar_texto(texto):
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
 
-if not st.session_state.get("logged_in"):
-    login_screen()
-    st.stop()
+
 
 st.title("Dashboard de Atendimentos Call Center")
 
