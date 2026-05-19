@@ -16,7 +16,7 @@ import io
 
 # Alteracao: O caminho do historico agora aponta para a pasta 'Data'
 # Este caminho sera usado para a API do GitHub
-HISTORICO_PATH = "Data/historico_atendimentos.parquet" # Alterado para apontar para a pasta Data
+HISTORICO_PATH = "Data/historico_atendimentos.parquet" # CORRIGIDO: Aponta para a pasta Data no GitHub
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
 
@@ -344,7 +344,7 @@ def integrar_dados(df_zen, df_gen):
     return df
 
 
-# -------------------- Historico (Modificado para usar GitHub API) --------------------
+# -------------------- Historico (CORRIGIDO para usar GitHub API) --------------------
 
 @st.cache_data(show_spinner="Carregando historico do GitHub...", ttl=60)
 def carregar_historico():
@@ -485,49 +485,13 @@ def secao_visao_geral(df):
 
     st.markdown("---")
 
-    c1, c2 = st.columns(2)
-
-    # Pizza tipo de desconexao
-    with c1:
-        if "tipo_desconexao" in df.columns and df["tipo_desconexao"].notna().any():
-            df_desc = df["tipo_desconexao"].dropna().value_counts().reset_index()
-            df_desc.columns = ["tipo", "quantidade"]
-            fig_desc = px.pie(
-                df_desc, names="tipo", values="quantidade",
-                title="Tipos de desconexao",
-                hole=0.4
-            )
-            fig_desc.update_traces(textinfo="label+percent")
-            st.plotly_chart(fig_desc, use_container_width=True, key="vg_desconexao")
-
-    # Atendimentos por agente
-    with c2:
-        if "nome_agente" in df.columns and df["nome_agente"].notna().any():
-            df_ag = (
-                df[df["nome_agente"].notna()]
-                .groupby("nome_agente")
-                .size()
-                .reset_index(name="atendimentos")
-                .sort_values("atendimentos", ascending=False)
-            )
-            fig_ag = px.bar(
-                df_ag, x="nome_agente", y="atendimentos", text="atendimentos",
-                title="Atendimentos por agente",
-                labels={"nome_agente": "Agente", "atendimentos": "Atendimentos"}
-            )
-            fig_ag.update_traces(textposition="outside")
-            fig_ag.update_layout(xaxis_tickangle=-30)
-            st.plotly_chart(fig_ag, use_container_width=True, key="vg_agente")
-
-    st.markdown("---")
-
-    # Componentes de tempo medio geral
+    # Componentes de tempo (geral)
     componentes = {
-        "URA":          "ura_segundos",
-        "Fila":         "fila_segundos",
-        "Conversa":     "conversas_segundos",
-        "TPC":          "tpc_segundos",
-        "Tratamento":   "tratamento_segundos",
+        "URA":        "ura_segundos",
+        "Fila":       "fila_segundos",
+        "Conversa":   "conversas_segundos",
+        "TPC":        "tpc_segundos",
+        "Tratamento": "tratamento_segundos",
     }
     dados_comp = [
         {"componente": k, "media_s": df[v].mean()}
@@ -667,241 +631,5 @@ def secao_detalhe_agente(df):
             df_comp, x="componente", y="media_s", text="Tempo medio",
             title=f"Tempo medio por componente - {agente_sel}",
             labels={"componente": "Componente", "media_s": "Segundos"}
-        )
-        fig.update_traces(textposition="outside")
-        st.plotly_chart(fig, use_container_width=True, key="da_componentes")
-
-    st.markdown("---")
-
-    if "tipo_desconexao" in df_ag.columns and df_ag["tipo_desconexao"].notna().any():
-        df_desc = df_ag["tipo_desconexao"].dropna().value_counts().reset_index()
-        df_desc.columns = ["tipo", "quantidade"]
-        df_desc["pct"] = (df_desc["quantidade"] / df_desc["quantidade"].sum() * 100).round(1)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_d = px.pie(
-                df_desc, names="tipo", values="quantidade",
-                title="Tipos de desconexao",
-                hole=0.4
-            )
-            fig_d.update_traces(textinfo="label+percent")
-            st.plotly_chart(fig_d, use_container_width=True, key="da_desconexao_pie")
-        with c2:
-            st.dataframe(
-                df_desc.rename(columns={"tipo": "Tipo", "quantidade": "Qtd", "pct": "%"}),
-                use_container_width=True
-            )
-
-    st.markdown("---")
-
-    if "data_atendimento" in df_ag.columns and df_ag["data_atendimento"].notna().any():
-        df_dia = (
-            df_ag.set_index("data_atendimento")
-            .resample("D")
-            .size()
-            .reset_index(name="atendimentos")
-        )
-        df_dia["data_str"] = df_dia["data_atendimento"].dt.strftime("%d/%m/%Y")
-        fig2 = px.bar(
-            df_dia, x="data_str", y="atendimentos", text="atendimentos",
-            title=f"Volume diario - {agente_sel}",
-            labels={"data_str": "Data", "atendimentos": "Atendimentos"}
-        )
-        fig2.update_traces(textposition="outside")
-        fig2.update_layout(xaxis_tickangle=-30)
-        st.plotly_chart(fig2, use_container_width=True, key="da_volume_diario")
 
 
-# -------------------- Por Assunto --------------------
-
-def secao_por_assunto(df):
-    st.subheader("Atendimentos por assunto")
-
-    if "assunto" not in df.columns or df["assunto"].isna().all():
-        st.info("Ainda nao ha assuntos cruzados com o Zendesk.")
-        return
-
-    col_tma = _col_tma(df)
-
-    df_ass = (
-        df[df["assunto"].notna()]
-        .groupby("assunto")
-        .agg(
-            atendimentos=(col_tma, "count"),
-            tma_s=(col_tma, "mean"),
-            tempo_total_s=("duracao_segundos", "sum"),
-        )
-        .reset_index()
-        .sort_values("atendimentos", ascending=False)
-    )
-    df_ass["TMA"]         = df_ass["tma_s"].apply(formatar_tempo)
-    df_ass["Tempo Total"] = df_ass["tempo_total_s"].apply(formatar_tempo)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        fig = px.bar(
-            df_ass, x="assunto", y="atendimentos", text="atendimentos",
-            title="Volume por assunto",
-            labels={"assunto": "Assunto", "atendimentos": "Atendimentos"}
-        )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(xaxis_tickangle=-30)
-        st.plotly_chart(fig, use_container_width=True, key="ass_volume")
-    with c2:
-        fig2 = px.bar(
-            df_ass, x="assunto", y="tma_s", text=df_ass["TMA"],
-            title="TMA por assunto",
-            labels={"assunto": "Assunto", "tma_s": "TMA (s)"}
-        )
-        fig2.update_traces(textposition="outside")
-        fig2.update_layout(xaxis_tickangle=-30)
-        st.plotly_chart(fig2, use_container_width=True, key="ass_tma")
-
-    st.dataframe(
-        df_ass[["assunto", "atendimentos", "TMA", "Tempo Total"]],
-        use_container_width=True
-    )
-
-
-# -------------------- Top TMA por mes --------------------
-
-def secao_top_assuntos_tma(df):
-    st.subheader("Top 10 assuntos por TMA - por mes")
-
-    if "assunto" not in df.columns or df["assunto"].isna().all():
-        st.info("Ainda nao ha assuntos cruzados com o Zendesk.")
-        return
-
-    if "mes" not in df.columns or df["mes"].isna().all():
-        st.info("Coluna de mes nao disponivel.")
-        return
-
-    col_tma = _col_tma(df)
-    meses   = sorted(df["mes"].dropna().astype(str).unique().tolist())
-    mes_sel = st.selectbox("Selecione o mes", meses, key="sel_mes_top_tma")
-
-    df_mes = df[(df["mes"].astype(str) == mes_sel) & df["assunto"].notna()].copy()
-    if df_mes.empty:
-        st.info("Sem dados para este mes.")
-        return
-
-    df_top = (
-        df_mes.groupby("assunto")
-        .agg(atendimentos=(col_tma, "count"), tma_s=(col_tma, "mean"))
-        .reset_index()
-        .sort_values("tma_s", ascending=False)
-        .head(10)
-    )
-    df_top["TMA"] = df_top["tma_s"].apply(formatar_tempo)
-
-    fig = px.bar(
-        df_top.sort_values("tma_s", ascending=True),
-        x="tma_s", y="assunto", orientation="h",
-        text="TMA", color="tma_s", color_continuous_scale="Reds",
-        title=f"Top 10 assuntos com maior TMA - {mes_sel}",
-        labels={"tma_s": "TMA (s)", "assunto": "Assunto"}
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(coloraxis_showscale=False, yaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(fig, use_container_width=True, key="top_tma_bar")
-
-    st.dataframe(
-        df_top[["assunto", "atendimentos", "TMA"]].reset_index(drop=True),
-        use_container_width=True
-    )
-
-    if len(meses) > 1:
-        st.markdown("**Comparativo entre meses**")
-        df_todos = (
-            df[df["assunto"].notna()]
-            .groupby(["mes", "assunto"])
-            .agg(tma_s=(col_tma, "mean"))
-            .reset_index()
-        )
-        tops = []
-        for m in meses:
-            bloco = (
-                df_todos[df_todos["mes"].astype(str) == m]
-                .sort_values("tma_s", ascending=False)
-                .head(10)
-            )
-            tops.append(bloco)
-        df_comp = pd.concat(tops, ignore_index=True)
-        df_comp["TMA"] = df_comp["tma_s"].apply(formatar_tempo)
-        fig2 = px.bar(
-            df_comp, x="assunto", y="tma_s", color="mes",
-            barmode="group", text="TMA",
-            title="TMA por assunto - comparativo entre meses",
-            labels={"tma_s": "TMA (s)", "assunto": "Assunto", "mes": "Mes"}
-        )
-        fig2.update_traces(textposition="outside")
-        fig2.update_layout(xaxis_tickangle=-30)
-        st.plotly_chart(fig2, use_container_width=True, key="top_tma_comp")
-
-
-# -------------------- Upload & main --------------------
-
-def secao_upload():
-    st.sidebar.header("Upload mensal")
-
-    arq_zen = st.sidebar.file_uploader("Zendesk (XLSX)", type=["xlsx", "xls"])
-    arq_gen = st.sidebar.file_uploader("Genesys (XLSX)", type=["xlsx", "xls"])
-
-    if arq_gen is not None:
-        if st.sidebar.button("Processar e acumular"):
-            df_zen = carregar_zendesk(arq_zen.read(), arq_zen.name) if arq_zen else pd.DataFrame()
-            df_gen = carregar_genesys(arq_gen.read(), arq_gen.name)
-            df_novo = integrar_dados(df_zen, df_gen)
-
-            if df_novo.empty:
-                st.sidebar.error("Nenhum dado gerado.")
-                return
-
-            df_hist = carregar_historico()
-            df_acum = adicionar_ao_historico(df_novo, df_hist)
-            if salvar_historico(df_acum):
-                st.sidebar.success(f"Dados acumulados e salvos no GitHub. Total: {len(df_acum)} registros.")
-                st.rerun()
-
-    with st.sidebar.expander("Gerenciar historico"):
-        if st.button("Apagar historico"):
-            if delete_file_from_github(HISTORICO_PATH, "Apaga historico de atendimentos"):
-                carregar_historico.clear()
-                st.success("Historico apagado do GitHub.")
-                st.rerun()
-            else:
-                st.error("Erro ao apagar historico do GitHub.")
-
-
-def main():
-    st.title("Dashboard de Atendimentos - Call Center")
-
-    secao_upload()
-    df_hist = carregar_historico()
-
-    if df_hist.empty:
-        st.info("Faca o upload do arquivo Genesys (XLSX) para comecar. O historico sera salvo no GitHub.")
-        return
-
-    df_filtrado = aplicar_filtros(df_hist)
-    if df_filtrado.empty:
-        st.warning("Nenhum registro para os filtros atuais.")
-        return
-
-    aba1, aba2, aba3, aba4, aba5 = st.tabs([
-        "Visao geral",
-        "Por agente",
-        "Detalhe do agente",
-        "Por assunto",
-        "Top TMA por mes",
-    ])
-    with aba1: secao_visao_geral(df_filtrado)
-    with aba2: secao_por_agente(df_filtrado)
-    with aba3: secao_detalhe_agente(df_filtrado)
-    with aba4: secao_por_assunto(df_filtrado)
-    with aba5: secao_top_assuntos_tma(df_filtrado)
-
-
-if __name__ == "__main__":
-    main()
