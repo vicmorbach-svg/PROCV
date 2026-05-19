@@ -16,7 +16,7 @@ import io
 
 # Alteracao: O caminho do historico agora aponta para a pasta 'Data'
 # Este caminho sera usado para a API do GitHub
-HISTORICO_PATH = "Data/historico_atendimentos.parquet"
+HISTORICO_PATH = "Data/historico_atendimentos.parquet" # Alterado para apontar para a pasta Data
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
 
