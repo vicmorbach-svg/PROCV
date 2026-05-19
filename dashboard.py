@@ -27,47 +27,7 @@ if hora_atual < 8 or hora_atual >= 18:
     st.info("O painel de análise funciona apenas das 08h às 18h para economia de recursos.")
     st.stop() # Interrompe a execução de todo o resto do código abaixo
 
-# ══════════════════════════════════════════════════════════════
-# SISTEMA DE LOGIN (Integrado do app_analise.py)
-# ══════════════════════════════════════════════════════════════
 
-#def get_users():
-    users = {}
-    try:
-        secrets  = st.secrets["users"]
-        prefixes = set()
-        for key in secrets:
-            if key.endswith("_user"):
-                prefixes.add(key[:-5])
-        for prefix in prefixes:
-            username = secrets.get(f"{prefix}_user", "")
-            password = secrets.get(f"{prefix}_password", "")
-            role     = secrets.get(f"{prefix}_role", "user")
-            if username:
-                users[username] = {"password": password, "role": role}
-    except Exception:
-        pass
-    return users
-
-#def login_screen():
-    st.title("🔐 Login")
-    st.markdown("Faça login para acessar o sistema.")
-    with st.form("login_form"):
-        username  = st.text_input("Usuário")
-        password  = st.text_input("Senha", type="password")
-        submitted = st.form_submit_button("Entrar")
-    if submitted:
-        users = get_users()
-        if username in users and users[username]["password"] == password:
-            st.session_state["logged_in"] = True
-            st.session_state["username"]  = username
-            st.session_state["role"]      = users[username]["role"]
-            st.rerun()
-        else:
-            st.error("Usuário ou senha incorretos.")
-
-#def is_admin():
-    return st.session_state.get("role") == "admin"
 
 # ══════════════════════════════════════════════════════════════
 # GITHUB — Integração (Integrado do app_analise.py)
