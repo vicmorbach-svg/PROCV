@@ -8,9 +8,98 @@ import gc
 import plotly.express as px
 from io import BytesIO
 
-HISTORICO_PATH = "data/historico_atendimentos.parquet"
+# Adicionadas as importacoes necessarias para as funcoes do GitHub
+import requests
+import base64
+import json
+import io
+
+# Alteracao: O caminho do historico agora aponta para a pasta 'Data'
+# Este caminho sera usado para a API do GitHub
+HISTORICO_PATH = "Data/historico_atendimentos.parquet"
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
+
+# -------------------- Funcoes de Interacao com GitHub (copiadas do seu outro app) --------------------
+
+def get_github_config():
+    try:
+        # st.secrets deve ser configurado no Streamlit Cloud com as credenciais do GitHub
+        token  = st.secrets["github"]["token"]
+        repo   = st.secrets["github"]["repo"]
+        branch = st.secrets["github"].get("branch", "main")
+        return token, repo, branch
+    except Exception:
+        st.error("Erro ao carregar configuracao do GitHub. Verifique st.secrets.")
+        return None, None, None
+
+def get_github_headers():
+    token, _, _ = get_github_config()
+    if not token: return {}
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+def get_file_sha(path):
+    token, repo, branch = get_github_config()
+    if not token: return None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    r   = requests.get(url, headers=get_github_headers())
+    if r.status_code == 200:
+        data = r.json()
+        if isinstance(data, dict): return data.get("sha")
+    return None
+
+def get_file_from_github(path):
+    token, repo, branch = get_github_config()
+    if not token: return None, None
+    # A API de contents retorna o conteudo base64-encoded, entao nao usamos raw.githubusercontent
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    r = requests.get(url, headers=get_github_headers())
+    if r.status_code == 200:
+        data = r.json()
+        if "content" in data:
+            content_bytes = base64.b64decode(data["content"])
+            return content_bytes, data.get("sha")
+    return None, None
+
+def save_file_to_github(path, content_bytes, message):
+    token, repo, branch = get_github_config()
+    if not token: return False
+    sha = get_file_sha(path) # Obtem o SHA atual para atualizacao
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch":  branch
+    }
+    if sha: payload["sha"] = sha # Se o arquivo existe, precisa do SHA para atualizar
+    r = requests.put(url, headers=get_github_headers(), data=json.dumps(payload))
+    return r.status_code in [200, 201]
+
+def delete_file_from_github(path, message):
+    token, repo, branch = get_github_config()
+    if not token: return False
+    sha = get_file_sha(path)
+    if not sha: return True # Se nao tem SHA, o arquivo ja nao existe, entao consideramos sucesso
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {"message": message, "sha": sha, "branch": branch}
+    r = requests.delete(url, headers=get_github_headers(), data=json.dumps(payload))
+    return r.status_code == 200
+
+def df_to_parquet_bytes(df):
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False, engine='pyarrow')
+    buf.seek(0)
+    return buf.getvalue()
+
+def parquet_bytes_to_df(content_bytes, colunas=None):
+    if not content_bytes: return None
+    try:
+        buf = io.BytesIO(content_bytes)
+        buf.seek(0)
+        return pd.read_parquet(buf, engine='pyarrow', columns=colunas)
+    except Exception as e:
+        st.error(f"Erro ao ler arquivo Parquet do GitHub: {e}")
+        return None
 
 # -------------------- Utils --------------------
 
@@ -255,26 +344,29 @@ def integrar_dados(df_zen, df_gen):
     return df
 
 
-# -------------------- Historico --------------------
+# -------------------- Historico (Modificado para usar GitHub API) --------------------
 
-@st.cache_data(show_spinner="Carregando historico...", ttl=60)
+@st.cache_data(show_spinner="Carregando historico do GitHub...", ttl=60)
 def carregar_historico():
-    if os.path.exists(HISTORICO_PATH):
-        try:
-            df = pd.read_parquet(HISTORICO_PATH)
+    content_bytes, _ = get_file_from_github(HISTORICO_PATH)
+    if content_bytes:
+        df = parquet_bytes_to_df(content_bytes)
+        if df is not None:
             for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors="coerce")
             return df
-        except Exception:
-            return pd.DataFrame()
     return pd.DataFrame()
 
 def salvar_historico(df):
     try:
-        df.to_parquet(HISTORICO_PATH, index=False)
-        carregar_historico.clear()
-        return True
+        parquet_data = df_to_parquet_bytes(df)
+        if save_file_to_github(HISTORICO_PATH, parquet_data, "Atualiza historico de atendimentos"):
+            carregar_historico.clear() # Limpa o cache para recarregar da fonte
+            return True
+        else:
+            st.error("Erro ao salvar historico no GitHub.")
+            return False
     except Exception as e:
         st.error(f"Erro ao salvar historico: {e}")
         return False
@@ -393,7 +485,7 @@ def secao_visao_geral(df):
 
     st.markdown("---")
 
-    c1, = st.columns(1)
+    c1, c2 = st.columns(2)
 
     # Pizza tipo de desconexao
     with c1:
@@ -408,7 +500,6 @@ def secao_visao_geral(df):
             fig_desc.update_traces(textinfo="label+percent")
             st.plotly_chart(fig_desc, use_container_width=True, key="vg_desconexao")
 
-    c2, = st.columns(1)
     # Atendimentos por agente
     with c2:
         if "nome_agente" in df.columns and df["nome_agente"].notna().any():
@@ -501,7 +592,7 @@ def secao_por_agente(df):
     df_ag["TMA"]         = df_ag["tma_s"].apply(formatar_tempo)
     df_ag["Tempo Total"] = df_ag["tempo_total_s"].apply(formatar_tempo)
 
-    c1, = st.columns(1)
+    c1, c2 = st.columns(2)
     with c1:
         fig = px.bar(
             df_ag, x="nome_agente", y="atendimentos", text="atendimentos",
@@ -511,8 +602,6 @@ def secao_por_agente(df):
         fig.update_traces(textposition="outside")
         fig.update_layout(xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True, key="pa_atendimentos")
-
-    c2, = st.columns(1)
     with c2:
         fig2 = px.bar(
             df_ag, x="nome_agente", y="tma_s", text=df_ag["TMA"],
@@ -649,7 +738,7 @@ def secao_por_assunto(df):
     df_ass["TMA"]         = df_ass["tma_s"].apply(formatar_tempo)
     df_ass["Tempo Total"] = df_ass["tempo_total_s"].apply(formatar_tempo)
 
-    c1, = st.columns(1)
+    c1, c2 = st.columns(2)
     with c1:
         fig = px.bar(
             df_ass, x="assunto", y="atendimentos", text="atendimentos",
@@ -659,8 +748,6 @@ def secao_por_assunto(df):
         fig.update_traces(textposition="outside")
         fig.update_layout(xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True, key="ass_volume")
-
-    c2, = st.columns(1)
     with c2:
         fig2 = px.bar(
             df_ass, x="assunto", y="tma_s", text=df_ass["TMA"],
@@ -774,16 +861,17 @@ def secao_upload():
             df_hist = carregar_historico()
             df_acum = adicionar_ao_historico(df_novo, df_hist)
             if salvar_historico(df_acum):
-                st.sidebar.success(f"Dados acumulados. Total: {len(df_acum)} registros.")
+                st.sidebar.success(f"Dados acumulados e salvos no GitHub. Total: {len(df_acum)} registros.")
                 st.rerun()
 
     with st.sidebar.expander("Gerenciar historico"):
         if st.button("Apagar historico"):
-            if os.path.exists(HISTORICO_PATH):
-                os.remove(HISTORICO_PATH)
+            if delete_file_from_github(HISTORICO_PATH, "Apaga historico de atendimentos"):
                 carregar_historico.clear()
-                st.success("Historico apagado.")
+                st.success("Historico apagado do GitHub.")
                 st.rerun()
+            else:
+                st.error("Erro ao apagar historico do GitHub.")
 
 
 def main():
@@ -793,7 +881,7 @@ def main():
     df_hist = carregar_historico()
 
     if df_hist.empty:
-        st.info("Faca o upload do arquivo Genesys (XLSX) para comecar.")
+        st.info("Faca o upload do arquivo Genesys (XLSX) para comecar. O historico sera salvo no GitHub.")
         return
 
     df_filtrado = aplicar_filtros(df_hist)
