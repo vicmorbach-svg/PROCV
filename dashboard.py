@@ -617,7 +617,7 @@ def secao_detalhe_agente(df):
         "Fila":       "fila_segundos",
         "Conversa":   "conversas_segundos",
         "TPC":        "tpc_segundos",
-        "Tratamento": "tratamento_segundos",
+        "Tratamento": "tratamento_segundos"
     }
     dados_comp = [
         {"componente": k, "media_s": df_ag[v].mean()}
