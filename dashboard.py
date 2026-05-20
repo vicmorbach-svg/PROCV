@@ -8,9 +8,162 @@ import gc
 import plotly.express as px
 from io import BytesIO
 
+# Importações adicionais para a API do GitHub
+import requests
+import base64
+import json
+import io
+
+# O caminho para o arquivo de histórico dentro do repositório GitHub
 HISTORICO_PATH = "historico_atendimentos.parquet"
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
+
+# -------------------- Funções de Interação com a API do GitHub --------------------
+
+def get_github_config():
+    """
+    Obtém as configurações do GitHub a partir de st.secrets.
+    Requer um arquivo .streamlit/secrets.toml com a seguinte estrutura:
+    [github]
+    token = "SEU_PERSONAL_ACCESS_TOKEN"
+    repo = "SEU_USUARIO/SEU_REPOSITORIO"
+    branch = "main"
+    """
+    try:
+        token  = st.secrets["github"]["token"]
+        repo   = st.secrets["github"]["repo"]
+        branch = st.secrets["github"].get("branch", "main")
+        return token, repo, branch
+    except KeyError:
+        st.error("As credenciais do GitHub não estão configuradas em `st.secrets`. Por favor, verifique o arquivo `.streamlit/secrets.toml`.")
+        return None, None, None
+    except Exception as e:
+        st.error(f"Erro ao carregar configurações do GitHub: {e}")
+        return None, None, None
+
+def get_github_headers():
+    """
+    Retorna os cabeçalhos de autenticação para as requisições da API do GitHub.
+    """
+    token, _, _ = get_github_config()
+    if not token:
+        return {}
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+def get_file_sha(path):
+    """
+    Obtém o SHA do arquivo no GitHub, necessário para atualizações.
+    """
+    token, repo, branch = get_github_config()
+    if not token or not repo or not branch:
+        return None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    try:
+        r   = requests.get(url, headers=get_github_headers())
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                return data.get("sha")
+        elif r.status_code == 404: # Arquivo não existe
+            return None
+        else:
+            st.error(f"Erro ao obter SHA do arquivo '{path}' do GitHub (Status: {r.status_code}): {r.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erro de conexão ao obter SHA do arquivo '{path}' do GitHub: {e}")
+    return None
+
+def get_file_from_github(path):
+    """
+    Baixa o conteúdo de um arquivo do GitHub.
+    Retorna o conteúdo em bytes e o SHA do arquivo.
+    """
+    token, repo, branch = get_github_config()
+    if not token or not repo or not branch:
+        return None, None
+    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+    try:
+        r = requests.get(raw_url, headers={"Authorization": f"token {token}"})
+        if r.status_code == 200 and len(r.content) > 0:
+            return r.content, get_file_sha(path)
+        elif r.status_code == 404: # Arquivo não existe
+            return None, None
+        else:
+            st.error(f"Erro ao baixar arquivo '{path}' do GitHub (Status: {r.status_code}): {r.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erro de conexão ao baixar arquivo '{path}' do GitHub: {e}")
+    return None, None
+
+def save_file_to_github(path, content_bytes, message):
+    """
+    Salva (cria ou atualiza) um arquivo no GitHub.
+    """
+    token, repo, branch = get_github_config()
+    if not token or not repo or not branch:
+        return False
+    sha = get_file_sha(path) # Tenta obter o SHA para saber se é uma atualização ou criação
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch":  branch
+    }
+    if sha: # Se o arquivo já existe, inclui o SHA para atualização
+        payload["sha"] = sha
+    try:
+        r = requests.put(url, headers=get_github_headers(), data=json.dumps(payload))
+        if r.status_code in [200, 201]:
+            return True
+        else:
+            st.error(f"Erro ao salvar arquivo '{path}' no GitHub (Status: {r.status_code}): {r.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erro de conexão ao salvar arquivo '{path}' no GitHub: {e}")
+    return False
+
+def delete_file_from_github(path, message):
+    """
+    Exclui um arquivo do GitHub.
+    """
+    token, repo, branch = get_github_config()
+    if not token or not repo or not branch:
+        return False
+    sha = get_file_sha(path)
+    if not sha: # Se o arquivo não existe, considera como já excluído
+        return True
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {"message": message, "sha": sha, "branch": branch}
+    try:
+        r = requests.delete(url, headers=get_github_headers(), data=json.dumps(payload))
+        if r.status_code == 200:
+            return True
+        else:
+            st.error(f"Erro ao excluir arquivo '{path}' do GitHub (Status: {r.status_code}): {r.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erro de conexão ao excluir arquivo '{path}' do GitHub: {e}")
+    return False
+
+def df_to_parquet_bytes(df):
+    """
+    Converte um DataFrame do Pandas para bytes no formato Parquet.
+    """
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False, engine='pyarrow')
+    buf.seek(0)
+    return buf.getvalue()
+
+def parquet_bytes_to_df(content_bytes, colunas=None):
+    """
+    Converte bytes no formato Parquet para um DataFrame do Pandas.
+    """
+    if not content_bytes:
+        return pd.DataFrame() # Retorna DataFrame vazio se não houver conteúdo
+    try:
+        buf = io.BytesIO(content_bytes)
+        buf.seek(0)
+        return pd.read_parquet(buf, engine='pyarrow', columns=colunas)
+    except Exception as e:
+        st.error(f"Erro ao converter bytes Parquet para DataFrame: {e}")
+        return pd.DataFrame()
 
 # -------------------- Utils --------------------
 
@@ -259,24 +412,34 @@ def integrar_dados(df_zen, df_gen):
 
 @st.cache_data(show_spinner="Carregando historico...", ttl=60)
 def carregar_historico():
-    if os.path.exists(HISTORICO_PATH):
-        try:
-            df = pd.read_parquet(HISTORICO_PATH)
-            for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors="coerce")
-            return df
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
+    """
+    Carrega o histórico de atendimentos do arquivo Parquet do GitHub.
+    """
+    st.info(f"Tentando carregar histórico do GitHub: {HISTORICO_PATH}")
+    content_bytes, _ = get_file_from_github(HISTORICO_PATH)
+    df = parquet_bytes_to_df(content_bytes)
+    if not df.empty:
+        for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        st.success(f"Histórico carregado do GitHub: {len(df)} registros.")
+    else:
+        st.info("Nenhum arquivo de histórico encontrado no GitHub ou arquivo vazio. Começando com dados vazios.")
+    return df
 
 def salvar_historico(df):
-    try:
-        df.to_parquet(HISTORICO_PATH, index=False)
-        carregar_historico.clear()
+    """
+    Salva o DataFrame de histórico como um arquivo Parquet no GitHub.
+    """
+    st.info(f"Tentando salvar histórico no GitHub: {HISTORICO_PATH}")
+    content_bytes = df_to_parquet_bytes(df)
+    message = f"Atualiza histórico de atendimentos com {len(df)} registros."
+    if save_file_to_github(HISTORICO_PATH, content_bytes, message):
+        carregar_historico.clear() # Limpa o cache para recarregar na próxima vez
+        st.success(f"Histórico salvo no GitHub: {len(df)} registros.")
         return True
-    except Exception as e:
-        st.error(f"Erro ao salvar historico: {e}")
+    else:
+        st.error("Falha ao salvar histórico no GitHub.")
         return False
 
 def adicionar_ao_historico(df_novo, df_hist):
@@ -766,29 +929,31 @@ def secao_upload():
                 st.sidebar.error("Nenhum dado gerado.")
                 return
 
-            df_hist = carregar_historico()
+            df_hist = carregar_historico() # Carrega o histórico atual do GitHub
             df_acum = adicionar_ao_historico(df_novo, df_hist)
-            if salvar_historico(df_acum):
-                st.sidebar.success(f"Dados acumulados. Total: {len(df_acum)} registros.")
+            if salvar_historico(df_acum): # Salva o histórico atualizado no GitHub
+                st.sidebar.success(f"Dados acumulados e salvos no GitHub. Total: {len(df_acum)} registros.")
                 st.rerun()
 
     with st.sidebar.expander("Gerenciar historico"):
-        if st.button("Apagar historico"):
-            if os.path.exists(HISTORICO_PATH):
-                os.remove(HISTORICO_PATH)
-                carregar_historico.clear()
-                st.success("Historico apagado.")
+        st.warning("Esta seção interage diretamente com o repositório GitHub.")
+        if st.button("Apagar historico do GitHub"):
+            if delete_file_from_github(HISTORICO_PATH, "Exclui arquivo de histórico via Streamlit"):
+                carregar_historico.clear() # Limpa o cache
+                st.success("Histórico apagado do GitHub.")
                 st.rerun()
+            else:
+                st.error("Falha ao apagar histórico do GitHub.")
 
 
 def main():
     st.title("Dashboard de Atendimentos - Call Center")
 
     secao_upload()
-    df_hist = carregar_historico()
+    df_hist = carregar_historico() # Carrega o histórico do GitHub na inicialização
 
     if df_hist.empty:
-        st.info("Faca o upload do arquivo Genesys (XLSX) para comecar.")
+        st.info("Faça o upload do arquivo Genesys (XLSX) para começar, ou verifique se o arquivo de histórico existe no GitHub e as credenciais estão corretas.")
         return
 
     df_filtrado = aplicar_filtros(df_hist)
