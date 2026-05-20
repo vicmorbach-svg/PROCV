@@ -13,27 +13,21 @@ import requests
 import base64
 import json
 import io
+import datetime # Para gerar nomes de arquivos únicos
 
-# O caminho para o arquivo de histórico dentro do repositório GitHub
-HISTORICO_PATH = "historico_atendimentos.parquet"
+# O prefixo para os arquivos de histórico dentro do repositório GitHub
+HISTORICO_PREFIX = "historico_atendimentos_"
+HISTORICO_EXTENSION = ".parquet"
 
 st.set_page_config(page_title="Dashboard Call Center", layout="wide")
 
 # -------------------- Funções de Interação com a API do GitHub --------------------
 
 def get_github_config():
-    """
-    Obtém as configurações do GitHub a partir de st.secrets.
-    Requer um arquivo .streamlit/secrets.toml com a seguinte estrutura:
-    [github]
-    token = "SEU_PERSONAL_ACCESS_TOKEN"
-    repo = "SEU_USUARIO/SEU_REPOSITORIO"
-    branch = "main"
-    """
     try:
         token  = st.secrets["github"]["token"]
         repo   = st.secrets["github"]["repo"]
-        branch = st.secrets["github"]["branch"]
+        branch = st.secrets["github"].get("branch", "main")
         return token, repo, branch
     except KeyError:
         st.error("As credenciais do GitHub não estão configuradas em `st.secrets`. Por favor, verifique o arquivo `.streamlit/secrets.toml`.")
@@ -43,18 +37,12 @@ def get_github_config():
         return None, None, None
 
 def get_github_headers():
-    """
-    Retorna os cabeçalhos de autenticação para as requisições da API do GitHub.
-    """
     token, _, _ = get_github_config()
     if not token:
         return {}
     return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
 def get_file_sha(path):
-    """
-    Obtém o SHA do arquivo no GitHub, necessário para atualizações.
-    """
     token, repo, branch = get_github_config()
     if not token or not repo or not branch:
         return None
@@ -65,7 +53,7 @@ def get_file_sha(path):
             data = r.json()
             if isinstance(data, dict):
                 return data.get("sha")
-        elif r.status_code == 404: # Arquivo não existe
+        elif r.status_code == 404:
             return None
         else:
             st.error(f"Erro ao obter SHA do arquivo '{path}' do GitHub (Status: {r.status_code}): {r.text}")
@@ -74,10 +62,6 @@ def get_file_sha(path):
     return None
 
 def get_file_from_github(path):
-    """
-    Baixa o conteúdo de um arquivo do GitHub.
-    Retorna o conteúdo em bytes e o SHA do arquivo.
-    """
     token, repo, branch = get_github_config()
     if not token or not repo or not branch:
         return None, None
@@ -86,7 +70,7 @@ def get_file_from_github(path):
         r = requests.get(raw_url, headers={"Authorization": f"token {token}"})
         if r.status_code == 200 and len(r.content) > 0:
             return r.content, get_file_sha(path)
-        elif r.status_code == 404: # Arquivo não existe
+        elif r.status_code == 404:
             return None, None
         else:
             st.error(f"Erro ao baixar arquivo '{path}' do GitHub (Status: {r.status_code}): {r.text}")
@@ -95,20 +79,17 @@ def get_file_from_github(path):
     return None, None
 
 def save_file_to_github(path, content_bytes, message):
-    """
-    Salva (cria ou atualiza) um arquivo no GitHub.
-    """
     token, repo, branch = get_github_config()
     if not token or not repo or not branch:
         return False
-    sha = get_file_sha(path) # Tenta obter o SHA para saber se é uma atualização ou criação
+    sha = get_file_sha(path)
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     payload = {
         "message": message,
         "content": base64.b64encode(content_bytes).decode("utf-8"),
         "branch":  branch
     }
-    if sha: # Se o arquivo já existe, inclui o SHA para atualização
+    if sha:
         payload["sha"] = sha
     try:
         r = requests.put(url, headers=get_github_headers(), data=json.dumps(payload))
@@ -116,19 +97,18 @@ def save_file_to_github(path, content_bytes, message):
             return True
         else:
             st.error(f"Erro ao salvar arquivo '{path}' no GitHub (Status: {r.status_code}): {r.text}")
+            if r.status_code == 422 and "too large" in r.text:
+                st.error("O arquivo é muito grande para ser salvo diretamente no GitHub via API. Considere usar armazenamento em nuvem para arquivos maiores.")
     except requests.exceptions.RequestException as e:
         st.error(f"Erro de conexão ao salvar arquivo '{path}' no GitHub: {e}")
     return False
 
 def delete_file_from_github(path, message):
-    """
-    Exclui um arquivo do GitHub.
-    """
     token, repo, branch = get_github_config()
     if not token or not repo or not branch:
         return False
     sha = get_file_sha(path)
-    if not sha: # Se o arquivo não existe, considera como já excluído
+    if not sha:
         return True
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     payload = {"message": message, "sha": sha, "branch": branch}
@@ -142,21 +122,32 @@ def delete_file_from_github(path, message):
         st.error(f"Erro de conexão ao excluir arquivo '{path}' do GitHub: {e}")
     return False
 
+def list_files_in_github_repo(path=""):
+    token, repo, branch = get_github_config()
+    if not token or not repo or not branch:
+        return []
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    try:
+        r = requests.get(url, headers=get_github_headers())
+        if r.status_code == 200:
+            return [item["path"] for item in r.json() if item["type"] == "file"]
+        elif r.status_code == 404: # Diretório vazio ou não existe
+            return []
+        else:
+            st.error(f"Erro ao listar arquivos no GitHub (Status: {r.status_code}): {r.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erro de conexão ao listar arquivos no GitHub: {e}")
+    return []
+
 def df_to_parquet_bytes(df):
-    """
-    Converte um DataFrame do Pandas para bytes no formato Parquet.
-    """
     buf = io.BytesIO()
     df.to_parquet(buf, index=False, engine='pyarrow')
     buf.seek(0)
     return buf.getvalue()
 
 def parquet_bytes_to_df(content_bytes, colunas=None):
-    """
-    Converte bytes no formato Parquet para um DataFrame do Pandas.
-    """
     if not content_bytes:
-        return pd.DataFrame() # Retorna DataFrame vazio se não houver conteúdo
+        return pd.DataFrame()
     try:
         buf = io.BytesIO(content_bytes)
         buf.seek(0)
@@ -413,47 +404,81 @@ def integrar_dados(df_zen, df_gen):
 @st.cache_data(show_spinner="Carregando historico...", ttl=60)
 def carregar_historico():
     """
-    Carrega o histórico de atendimentos do arquivo Parquet do GitHub.
+    Carrega todos os arquivos de histórico Parquet do GitHub e os concatena.
     """
-    st.info(f"Tentando carregar histórico do GitHub: {HISTORICO_PATH}")
-    content_bytes, _ = get_file_from_github(HISTORICO_PATH)
-    df = parquet_bytes_to_df(content_bytes)
-    if not df.empty:
-        for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
-        st.success(f"Histórico carregado do GitHub: {len(df)} registros.")
-    else:
-        st.info("Nenhum arquivo de histórico encontrado no GitHub ou arquivo vazio. Começando com dados vazios.")
-    return df
+    st.info(f"Tentando carregar arquivos de histórico do GitHub com prefixo '{HISTORICO_PREFIX}'...")
+    all_files = list_files_in_github_repo()
+    parquet_files = [f for f in all_files if f.startswith(HISTORICO_PREFIX) and f.endswith(HISTORICO_EXTENSION)]
 
-def salvar_historico(df):
-    """
-    Salva o DataFrame de histórico como um arquivo Parquet no GitHub.
-    """
-    st.info(f"Tentando salvar histórico no GitHub: {HISTORICO_PATH}")
-    content_bytes = df_to_parquet_bytes(df)
-    message = f"Atualiza histórico de atendimentos com {len(df)} registros."
-    if save_file_to_github(HISTORICO_PATH, content_bytes, message):
-        carregar_historico.clear() # Limpa o cache para recarregar na próxima vez
-        st.success(f"Histórico salvo no GitHub: {len(df)} registros.")
-        return True
+    if not parquet_files:
+        st.warning("Nenhum arquivo de histórico encontrado no GitHub.")
+        return pd.DataFrame()
+
+    dfs = []
+    for file_path in parquet_files:
+        content_bytes, _ = get_file_from_github(file_path)
+        if content_bytes:
+            df_part = parquet_bytes_to_df(content_bytes)
+            if not df_part.empty:
+                dfs.append(df_part)
+                st.info(f"Carregado {len(df_part)} registros de '{file_path}'.")
+        else:
+            st.warning(f"Nao foi possivel carregar o arquivo '{file_path}'.")
+
+    if not dfs:
+        return pd.DataFrame()
+
+    df_full = pd.concat(dfs, ignore_index=True)
+
+    # Converter colunas de data/hora após a concatenação
+    for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
+        if col in df_full.columns:
+            df_full[col] = pd.to_datetime(df_full[col], errors="coerce")
+
+    # Remover duplicatas após carregar todos os arquivos
+    if "id_genesys_norm" in df_full.columns and df_full["id_genesys_norm"].notna().any():
+        df_full = df_full.drop_duplicates(subset=["id_genesys_norm"], keep="last")
     else:
-        st.error("Falha ao salvar histórico no GitHub.")
+        chaves = [c for c in ["nome_agente", "data_atendimento", "duracao_segundos"] if c in df_full.columns]
+        if chaves:
+            df_full = df_full.drop_duplicates(subset=chaves, keep="last")
+
+    st.success(f"Total de {len(df_full)} registros de histórico carregados do GitHub.")
+    return df_full.reset_index(drop=True)
+
+
+def salvar_novo_historico_parcial(df_novo_lote):
+    """
+    Salva um novo lote de dados como um arquivo Parquet separado no GitHub.
+    """
+    if df_novo_lote.empty:
+        st.warning("Nenhum dado para salvar no novo arquivo de histórico.")
         return False
 
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_file_name = f"{HISTORICO_PREFIX}{timestamp}{HISTORICO_EXTENSION}"
+
+    st.info(f"Tentando salvar novo arquivo de histórico no GitHub: '{new_file_name}'")
+    content_bytes = df_to_parquet_bytes(df_novo_lote)
+
+    if save_file_to_github(new_file_name, content_bytes, f"Adiciona novo lote de dados ({timestamp})"):
+        carregar_historico.clear() # Limpa o cache para recarregar todos os arquivos
+        return True
+    return False
+
 def adicionar_ao_historico(df_novo, df_hist):
+    # Esta função agora apenas combina os dados em memória para a análise atual
+    # A persistência de df_novo será feita separadamente por salvar_novo_historico_parcial
     if df_hist.empty:
         return df_novo.reset_index(drop=True)
 
     df_comb = pd.concat([df_hist, df_novo], ignore_index=True)
 
     if "id_genesys_norm" in df_comb.columns and df_comb["id_genesys_norm"].notna().any():
-        com_id = df_comb[df_comb["id_genesys_norm"].notna()]
-        sem_id = df_comb[df_comb["id_genesys_norm"].isna()]
-        com_id = com_id.drop_duplicates(subset=["id_genesys_norm"], keep="last")
-        df_comb = pd.concat([com_id, sem_id], ignore_index=True)
+        # Remove duplicatas baseadas em id_genesys_norm, mantendo a última ocorrência
+        df_comb = df_comb.drop_duplicates(subset=["id_genesys_norm"], keep="last")
     else:
+        # Fallback para remover duplicatas se id_genesys_norm não estiver disponível
         chaves = [c for c in ["nome_agente", "data_atendimento", "duracao_segundos"] if c in df_comb.columns]
         if chaves:
             df_comb = df_comb.drop_duplicates(subset=chaves, keep="last")
@@ -929,31 +954,58 @@ def secao_upload():
                 st.sidebar.error("Nenhum dado gerado.")
                 return
 
-            df_hist = carregar_historico() # Carrega o histórico atual do GitHub
-            df_acum = adicionar_ao_historico(df_novo, df_hist)
-            if salvar_historico(df_acum): # Salva o histórico atualizado no GitHub
-                st.sidebar.success(f"Dados acumulados e salvos no GitHub. Total: {len(df_acum)} registros.")
+            # Salva o novo lote de dados como um arquivo separado no GitHub
+            if salvar_novo_historico_parcial(df_novo):
+                st.sidebar.success(f"Novo lote de dados salvo no GitHub. Total de {len(df_novo)} registros.")
                 st.rerun()
+            else:
+                st.sidebar.error("Falha ao salvar o novo lote de dados no GitHub.")
 
     with st.sidebar.expander("Gerenciar historico"):
         st.warning("Esta seção interage diretamente com o repositório GitHub.")
-        if st.button("Apagar historico do GitHub"):
-            if delete_file_from_github(HISTORICO_PATH, "Exclui arquivo de histórico via Streamlit"):
-                carregar_historico.clear() # Limpa o cache
-                st.success("Histórico apagado do GitHub.")
-                st.rerun()
+
+        # Botão para listar arquivos
+        if st.button("Listar arquivos de histórico"):
+            parquet_files = [f for f in list_files_in_github_repo() if f.startswith(HISTORICO_PREFIX) and f.endswith(HISTORICO_EXTENSION)]
+            if parquet_files:
+                st.write("Arquivos de histórico no GitHub:")
+                for f in parquet_files:
+                    st.write(f"- {f}")
             else:
-                st.error("Falha ao apagar histórico do GitHub.")
+                st.info("Nenhum arquivo de histórico encontrado no GitHub.")
+
+        # Botão para apagar TODOS os arquivos de histórico
+        if st.button("Apagar TODOS os arquivos de histórico do GitHub"):
+            confirm = st.checkbox("Confirmar exclusao de TODOS os arquivos de historico?")
+            if confirm:
+                parquet_files = [f for f in list_files_in_github_repo() if f.startswith(HISTORICO_PREFIX) and f.endswith(HISTORICO_EXTENSION)]
+                if not parquet_files:
+                    st.info("Nenhum arquivo de histórico para apagar.")
+                else:
+                    st.info(f"Apagando {len(parquet_files)} arquivos de histórico...")
+                    all_deleted = True
+                    for file_path in parquet_files:
+                        if not delete_file_from_github(file_path, f"Exclui arquivo de histórico '{file_path}' via Streamlit"):
+                            all_deleted = False
+                            st.error(f"Falha ao apagar '{file_path}'.")
+                    if all_deleted:
+                        carregar_historico.clear()
+                        st.success("Todos os arquivos de histórico foram apagados do GitHub.")
+                        st.rerun()
+                    else:
+                        st.error("Alguns arquivos de histórico não puderam ser apagados.")
 
 
 def main():
     st.title("Dashboard de Atendimentos - Call Center")
 
-    secao_upload()
-    df_hist = carregar_historico() # Carrega o histórico do GitHub na inicialização
+    # Carrega o histórico completo (todos os arquivos) na inicialização
+    df_hist = carregar_historico()
+
+    secao_upload() # Chama a seção de upload após carregar o histórico
 
     if df_hist.empty:
-        st.info("Faça o upload do arquivo Genesys (XLSX) para começar, ou verifique se o arquivo de histórico existe no GitHub e as credenciais estão corretas.")
+        st.info("Faça o upload do arquivo Genesys (XLSX) para começar, ou verifique se há arquivos de histórico no GitHub e as credenciais estão corretas.")
         return
 
     df_filtrado = aplicar_filtros(df_hist)
