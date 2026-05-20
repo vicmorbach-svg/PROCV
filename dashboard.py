@@ -33,7 +33,7 @@ def get_github_config():
     try:
         token  = st.secrets["github"]["token"]
         repo   = st.secrets["github"]["repo"]
-        branch = st.secrets["github"].get("branch", "main")
+        branch = st.secrets["github"]["branch"]
         return token, repo, branch
     except KeyError:
         st.error("As credenciais do GitHub não estão configuradas em `st.secrets`. Por favor, verifique o arquivo `.streamlit/secrets.toml`.")
