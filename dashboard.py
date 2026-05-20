@@ -421,6 +421,7 @@ def carregar_historico():
             df_part = parquet_bytes_to_df(content_bytes)
             if not df_part.empty:
                 dfs.append(df_part)
+                st.info(f"Carregado {len(df_part)} registros de '{file_path}'.")
         else:
             st.warning(f"Nao foi possivel carregar o arquivo '{file_path}'.")
 
