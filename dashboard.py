@@ -406,12 +406,10 @@ def carregar_historico():
     """
     Carrega todos os arquivos de histórico Parquet do GitHub e os concatena.
     """
-    st.info(f"Tentando carregar arquivos de histórico do GitHub com prefixo '{HISTORICO_PREFIX}'...")
     all_files = list_files_in_github_repo()
     parquet_files = [f for f in all_files if f.startswith(HISTORICO_PREFIX) and f.endswith(HISTORICO_EXTENSION)]
 
     if not parquet_files:
-        st.warning("Nenhum arquivo de histórico encontrado no GitHub.")
         return pd.DataFrame()
 
     dfs = []
@@ -421,30 +419,31 @@ def carregar_historico():
             df_part = parquet_bytes_to_df(content_bytes)
             if not df_part.empty:
                 dfs.append(df_part)
-                st.info(f"Carregado {len(df_part)} registros de '{file_path}'.")
-        else:
-            st.warning(f"Nao foi possivel carregar o arquivo '{file_path}'.")
+        # Não há st.warning aqui, pois você pediu para remover as informações
+        # sobre o carregamento de arquivos individuais.
 
     if not dfs:
         return pd.DataFrame()
 
-    df_full = pd.concat(dfs, ignore_index=True)
+    df_final = pd.concat(dfs, ignore_index=True)
 
     # Converter colunas de data/hora após a concatenação
     for col in ["data_base", "data_atendimento", "data_criacao_zen"]:
-        if col in df_full.columns:
-            df_full[col] = pd.to_datetime(df_full[col], errors="coerce")
+        if col in df_final.columns:
+            df_final[col] = pd.to_datetime(df_final[col], errors="coerce")
 
     # Remover duplicatas após carregar todos os arquivos
-    if "id_genesys_norm" in df_full.columns and df_full["id_genesys_norm"].notna().any():
-        df_full = df_full.drop_duplicates(subset=["id_genesys_norm"], keep="last")
+    if "id_genesys_norm" in df_final.columns and df_final["id_genesys_norm"].notna().any():
+        # Prioriza a última ocorrência de um id_genesys_norm, assumindo que é a mais atual
+        df_final = df_final.drop_duplicates(subset=["id_genesys_norm"], keep="last")
     else:
-        chaves = [c for c in ["nome_agente", "data_atendimento", "duracao_segundos"] if c in df_full.columns]
+        # Fallback para chaves de duplicidade se id_genesys_norm não estiver disponível
+        chaves = [c for c in ["nome_agente", "data_atendimento", "duracao_segundos"] if c in df_final.columns]
         if chaves:
-            df_full = df_full.drop_duplicates(subset=chaves, keep="last")
+            df_final = df_final.drop_duplicates(subset=chaves, keep="last")
 
-    st.success(f"Total de {len(df_full)} registros de histórico carregados do GitHub.")
-    return df_full.reset_index(drop=True)
+    return df_final.reset_index(drop=True)
+
 
 
 def salvar_novo_historico_parcial(df_novo_lote):
